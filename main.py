@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse
 
 @dataclass
 class PostureConfig:
-    min_visibility: float = 0.5
+    min_visibility: float = 0.4
     y_delta_threshold: float = 0.1
     shoulder_tilt_threshold_deg: float = 12.0
     baseline_drop_ratio: float = 0.88
@@ -53,21 +53,11 @@ class PostureAnalyzer:
         except Exception:
             return None
 
-    def _extract_keypoints(
-        self, landmarks, width: int, height: int
-    ) -> Optional[Dict[str, Dict[str, float]]]:
-        wanted = {
-            "LEFT_EAR": self.mp_pose.PoseLandmark.LEFT_EAR,
-            "RIGHT_EAR": self.mp_pose.PoseLandmark.RIGHT_EAR,
-            "LEFT_SHOULDER": self.mp_pose.PoseLandmark.LEFT_SHOULDER,
-            "RIGHT_SHOULDER": self.mp_pose.PoseLandmark.RIGHT_SHOULDER,
-        }
+    def _extract_all_keypoints(self, landmarks, width: int, height: int) -> Dict[str, Dict[str, float]]:
         points: Dict[str, Dict[str, float]] = {}
-        for name, idx in wanted.items():
-            lm = landmarks.landmark[idx.value]
-            if lm.visibility < self.config.min_visibility:
-                return None
-            points[name] = {
+        for lm_enum in self.mp_pose.PoseLandmark:
+            lm = landmarks.landmark[lm_enum.value]
+            points[lm_enum.name] = {
                 "x": float(lm.x * width),
                 "y": float(lm.y * height),
                 "z": float(lm.z),
@@ -75,13 +65,30 @@ class PostureAnalyzer:
             }
         return points
 
+    def _validate_required_keypoints(
+        self, keypoints: Dict[str, Dict[str, float]]
+    ) -> Optional[Dict[str, Dict[str, float]]]:
+        required = {
+            "LEFT_EAR": self.mp_pose.PoseLandmark.LEFT_EAR,
+            "RIGHT_EAR": self.mp_pose.PoseLandmark.RIGHT_EAR,
+            "LEFT_SHOULDER": self.mp_pose.PoseLandmark.LEFT_SHOULDER,
+            "RIGHT_SHOULDER": self.mp_pose.PoseLandmark.RIGHT_SHOULDER,
+        }
+        for name, idx in required.items():
+            lm = keypoints.get(idx.name)
+            if not lm or lm["visibility"] < self.config.min_visibility:
+                return None
+        return keypoints
+
     @staticmethod
     def _line_angle_deg(a: Dict[str, float], b: Dict[str, float]) -> float:
         dy = b["y"] - a["y"]
         dx = b["x"] - a["x"]
         return float(np.degrees(np.arctan2(dy, dx)))
 
-    def evaluate(self, frame_b64: str) -> Dict:
+    def evaluate(
+        self, frame_b64: str, prev_keypoints: Optional[Dict[str, Dict[str, float]]] = None
+    ) -> Dict:
         start = time.perf_counter()
         frame = self._decode_frame(frame_b64)
         if frame is None:
@@ -105,13 +112,15 @@ class PostureAnalyzer:
                 "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
             }
 
-        keypoints = self._extract_keypoints(result.pose_landmarks, width, height)
-        if keypoints is None:
+        current_keypoints = self._extract_all_keypoints(result.pose_landmarks, width, height)
+        keypoints = smooth_keypoints(prev_keypoints, current_keypoints)
+        if self._validate_required_keypoints(keypoints) is None:
             return {
                 "status": "NO_POSE",
                 "reason": "low_visibility",
                 "keypoints": {},
                 "metrics": {},
+                "smoothed_keypoints": keypoints,
                 "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
             }
 
@@ -138,6 +147,7 @@ class PostureAnalyzer:
             "status": status,
             "reason": "slump_detected" if is_slump else "posture_ok",
             "keypoints": keypoints,
+            "posture_consistency_score": 0.0,
             "metrics": {
                 "avg_ear_shoulder_delta_px": round(float(avg_ear_shoulder_delta), 2),
                 "left_ear_shoulder_delta_px": round(float(left_delta_y), 2),
@@ -145,6 +155,7 @@ class PostureAnalyzer:
                 "shoulder_tilt_deg": round(float(shoulder_tilt_deg), 2),
             },
             "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
+            "smoothed_keypoints": keypoints,
         }
 
 
@@ -169,10 +180,35 @@ class SessionState:
     alarm_streak: int
     ok_streak: int
     stable_status: str
+    prev_keypoints: Dict[str, Dict[str, float]]
+
+
+def smooth_keypoints(
+    prev_keypoints: Optional[Dict[str, Dict[str, float]]], current_keypoints: Dict[str, Dict[str, float]]
+) -> Dict[str, Dict[str, float]]:
+    if not prev_keypoints:
+        return current_keypoints
+
+    alpha_prev = 0.7
+    alpha_curr = 0.3
+    smoothed: Dict[str, Dict[str, float]] = {}
+    for name, current in current_keypoints.items():
+        prev = prev_keypoints.get(name)
+        if not prev:
+            smoothed[name] = current
+            continue
+        smoothed[name] = {
+            "x": float(prev["x"] * alpha_prev + current["x"] * alpha_curr),
+            "y": float(prev["y"] * alpha_prev + current["y"] * alpha_curr),
+            "z": float(prev["z"] * alpha_prev + current["z"] * alpha_curr),
+            "visibility": float(prev["visibility"] * alpha_prev + current["visibility"] * alpha_curr),
+        }
+    return smoothed
 
 
 def apply_session_calibration(result: Dict, session: SessionState) -> Dict:
     if result.get("status") == "NO_POSE":
+        result["posture_consistency_score"] = 0.0
         return result
 
     metrics = result.get("metrics", {})
@@ -186,6 +222,8 @@ def apply_session_calibration(result: Dict, session: SessionState) -> Dict:
             session.baseline_delta_px = float(np.median(session.baseline_samples))
         result["status"] = "CALIBRATING"
         result["reason"] = "collecting_baseline"
+        progress = min(100.0, (len(session.baseline_samples) / 24.0) * 100.0)
+        result["posture_consistency_score"] = round(progress, 1)
         result["metrics"]["baseline_delta_px"] = (
             round(session.baseline_delta_px, 2) if session.baseline_delta_px else None
         )
@@ -216,6 +254,14 @@ def apply_session_calibration(result: Dict, session: SessionState) -> Dict:
 
     result["status"] = session.stable_status
     result["reason"] = "slump_detected" if session.stable_status == "ALARM" else "posture_ok"
+    if baseline > 0:
+        normalized = float(avg_delta) / baseline
+        score = max(0.0, min(100.0, normalized * 100.0))
+    else:
+        score = 0.0
+    if session.stable_status == "ALARM":
+        score = min(score, 45.0)
+    result["posture_consistency_score"] = round(score, 1)
     result["metrics"]["baseline_delta_px"] = round(baseline, 2)
     result["metrics"]["baseline_drop_threshold_px"] = round(drop_threshold, 2)
     result["metrics"]["baseline_release_threshold_px"] = round(release_threshold, 2)
@@ -239,6 +285,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         alarm_streak=0,
         ok_streak=0,
         stable_status="OK",
+        prev_keypoints={},
     )
     try:
         while True:
@@ -251,6 +298,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                         "status": "NO_POSE",
                         "reason": "missing_frame",
                         "keypoints": {},
+                        "posture_consistency_score": 0.0,
                         "metrics": {},
                         "inference_time_ms": 0.0,
                         "client_ts": client_ts,
@@ -266,6 +314,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                         "status": "NO_POSE",
                         "reason": "mediapipe_init_failed",
                         "keypoints": {},
+                        "posture_consistency_score": 0.0,
                         "metrics": {},
                         "inference_time_ms": 0.0,
                         "client_ts": client_ts,
@@ -274,8 +323,10 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 )
                 continue
 
-            result = model.evaluate(frame_data)
+            result = model.evaluate(frame_data, session.prev_keypoints)
+            session.prev_keypoints = result.get("smoothed_keypoints", {})
             result = apply_session_calibration(result, session)
+            result.pop("smoothed_keypoints", None)
             result["client_ts"] = client_ts
             result["server_ts"] = int(time.time() * 1000)
             await websocket.send_json(result)
