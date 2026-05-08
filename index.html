@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NeuroStrike MVP</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #090b10;
+        --panel: #121722;
+        --ok: #27e273;
+        --alarm: #ff5d5d;
+        --text: #dbe4ff;
+        --muted: #93a1c7;
+      }
+      body {
+        margin: 0;
+        font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: radial-gradient(circle at top, #13182c 0%, var(--bg) 60%);
+        color: var(--text);
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+      }
+      .app {
+        width: min(1000px, 96vw);
+        background: color-mix(in srgb, var(--panel) 80%, transparent);
+        border: 1px solid #27314f;
+        border-radius: 16px;
+        padding: 16px;
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+      }
+      .top {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+        flex-wrap: wrap;
+      }
+      .pill {
+        background: #19213a;
+        padding: 8px 12px;
+        border-radius: 999px;
+        font-size: 14px;
+        border: 1px solid #2a375e;
+      }
+      .status-ok {
+        color: var(--ok);
+      }
+      .status-alarm {
+        color: var(--alarm);
+      }
+      .status-neutral {
+        color: #ffd166;
+      }
+      .stage {
+        position: relative;
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid #27314f;
+      }
+      video,
+      canvas {
+        width: 100%;
+        max-height: 70vh;
+        display: block;
+        background: black;
+      }
+      .hidden {
+        display: none;
+      }
+      .legend {
+        margin-top: 10px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      button {
+        border: 0;
+        border-radius: 10px;
+        background: #3a63ff;
+        color: white;
+        font-weight: 600;
+        padding: 10px 14px;
+        cursor: pointer;
+      }
+      #stopBtn {
+        background: #5a637d;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <div class="top">
+        <button id="startBtn">Start NeuroStrike Loop</button>
+        <button id="stopBtn" disabled>Stop</button>
+        <div class="pill">Status: <span id="status" class="status-ok">IDLE</span></div>
+        <div class="pill">RTT: <span id="latency">-</span> ms</div>
+        <div class="pill">Inference: <span id="inferTime">-</span> ms</div>
+      </div>
+      <div class="stage">
+        <video id="video" playsinline muted class="hidden"></video>
+        <canvas id="canvas"></canvas>
+      </div>
+      <div class="legend">
+        Green = posture OK, Red = ALARM. Send rate is set to ~12 FPS for local real-time feedback.
+      </div>
+    </div>
+
+    <script>
+      const startBtn = document.getElementById("startBtn");
+      const stopBtn = document.getElementById("stopBtn");
+      const statusEl = document.getElementById("status");
+      const latencyEl = document.getElementById("latency");
+      const inferTimeEl = document.getElementById("inferTime");
+      const video = document.getElementById("video");
+      const canvas = document.getElementById("canvas");
+      const ctx = canvas.getContext("2d");
+
+      let ws;
+      let audioCtx;
+      let oscillator;
+      let gainNode;
+      let streamRunning = false;
+      let sendingInFlight = false;
+      let reconnectTimer = null;
+      const targetFps = 12;
+      const frameIntervalMs = Math.floor(1000 / targetFps);
+      const keypointNames = ["LEFT_EAR", "RIGHT_EAR", "LEFT_SHOULDER", "RIGHT_SHOULDER"];
+
+      function setStatus(text, isAlarm, isNeutral = false) {
+        statusEl.textContent = text;
+        statusEl.className = isNeutral ? "status-neutral" : isAlarm ? "status-alarm" : "status-ok";
+      }
+
+      function initAudio() {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        oscillator = audioCtx.createOscillator();
+        gainNode = audioCtx.createGain();
+        oscillator.type = "sawtooth";
+        oscillator.frequency.value = 220;
+        gainNode.gain.value = 0.0001;
+        oscillator.connect(gainNode).connect(audioCtx.destination);
+        oscillator.start();
+      }
+
+      function playFeedback(isAlarm, isNeutral = false) {
+        if (!audioCtx) return;
+        const now = audioCtx.currentTime;
+        oscillator.frequency.cancelScheduledValues(now);
+        gainNode.gain.cancelScheduledValues(now);
+        if (isNeutral) {
+          oscillator.frequency.setValueAtTime(220, now);
+          gainNode.gain.setTargetAtTime(0.0001, now, 0.03);
+          return;
+        }
+        if (isAlarm) {
+          oscillator.frequency.setValueAtTime(900, now);
+          gainNode.gain.setTargetAtTime(0.2, now, 0.01);
+        } else {
+          oscillator.frequency.setValueAtTime(240, now);
+          gainNode.gain.setTargetAtTime(0.0001, now, 0.03);
+        }
+      }
+
+      function drawSkeleton(points, isAlarm) {
+        const color = isAlarm ? "#ff5d5d" : "#27e273";
+        ctx.lineWidth = 3;
+        ctx.fillStyle = color;
+        ctx.strokeStyle = color;
+
+        const pairs = [
+          ["LEFT_EAR", "LEFT_SHOULDER"],
+          ["RIGHT_EAR", "RIGHT_SHOULDER"],
+          ["LEFT_SHOULDER", "RIGHT_SHOULDER"],
+        ];
+        pairs.forEach(([a, b]) => {
+          if (!points[a] || !points[b]) return;
+          ctx.beginPath();
+          ctx.moveTo(points[a].x, points[a].y);
+          ctx.lineTo(points[b].x, points[b].y);
+          ctx.stroke();
+        });
+
+        keypointNames.forEach((name) => {
+          if (!points[name]) return;
+          ctx.beginPath();
+          ctx.arc(points[name].x, points[name].y, 6, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      }
+
+      function getWsUrl() {
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        return `${proto}://${location.host}/ws`;
+      }
+
+      function connectWebSocket() {
+        if (!streamRunning) return;
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
+        setStatus("CONNECTING", false);
+        ws = new WebSocket(getWsUrl());
+
+        ws.onopen = () => {
+          setStatus("OK", false);
+        };
+
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          const now = Date.now();
+          const rtt = data.client_ts ? now - data.client_ts : 0;
+          latencyEl.textContent = String(rtt);
+          inferTimeEl.textContent = String(data.inference_time_ms ?? "-");
+          const isAlarm = data.status === "ALARM";
+          const isNeutral = data.status === "NO_POSE" || data.status === "CALIBRATING";
+          setStatus(data.status, isAlarm, isNeutral);
+          playFeedback(isAlarm, isNeutral);
+          lastResult = data;
+          sendingInFlight = false;
+        };
+
+        ws.onclose = () => {
+          if (!streamRunning) return;
+          setStatus("DISCONNECTED", true);
+          sendingInFlight = false;
+          if (streamRunning) {
+            reconnectTimer = setTimeout(connectWebSocket, 1500);
+          }
+        };
+
+        ws.onerror = () => setStatus("ERROR", true);
+      }
+
+      async function sendFrameLoop() {
+        while (streamRunning) {
+          const t0 = performance.now();
+          if (ws && ws.readyState === WebSocket.OPEN && !sendingInFlight) {
+            sendingInFlight = true;
+            const clientTs = Date.now();
+            const frameData = canvas.toDataURL("image/jpeg", 0.55);
+            ws.send(JSON.stringify({ frame: frameData, client_ts: clientTs }));
+          }
+          const elapsed = performance.now() - t0;
+          await new Promise((resolve) => setTimeout(resolve, Math.max(0, frameIntervalMs - elapsed)));
+        }
+      }
+
+      async function start() {
+        if (streamRunning) return;
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        setStatus("STARTING", false);
+
+        const media = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480, facingMode: "user" },
+          audio: false,
+        });
+        video.srcObject = media;
+        await video.play();
+
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+
+        initAudio();
+        await audioCtx.resume();
+
+        streamRunning = true;
+        requestAnimationFrame(drawLoop);
+        sendFrameLoop();
+        connectWebSocket();
+      }
+
+      function stop() {
+        if (!streamRunning) return;
+        streamRunning = false;
+        sendingInFlight = false;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        if (ws) {
+          try {
+            ws.close();
+          } catch (_err) {
+            // ignored
+          }
+          ws = null;
+        }
+        if (video.srcObject) {
+          video.srcObject.getTracks().forEach((t) => t.stop());
+          video.srcObject = null;
+        }
+        if (audioCtx) {
+          try {
+            gainNode.gain.setTargetAtTime(0.0001, audioCtx.currentTime, 0.02);
+            oscillator.stop();
+          } catch (_err) {
+            // ignored
+          }
+          audioCtx.close();
+          audioCtx = null;
+          oscillator = null;
+          gainNode = null;
+        }
+        lastResult = null;
+        latencyEl.textContent = "-";
+        inferTimeEl.textContent = "-";
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        setStatus("IDLE", false);
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      }
+
+      let lastResult = null;
+      function drawLoop() {
+        if (!streamRunning) return;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        if (lastResult && lastResult.keypoints) {
+          drawSkeleton(lastResult.keypoints, lastResult.status === "ALARM");
+        }
+        requestAnimationFrame(drawLoop);
+      }
+
+      startBtn.addEventListener("click", () => {
+        start().catch((err) => {
+          console.error(err);
+          setStatus("INIT_FAILED", true);
+          startBtn.disabled = false;
+          stopBtn.disabled = true;
+        });
+      });
+
+      stopBtn.addEventListener("click", stop);
+    </script>
+  </body>
+</html>
