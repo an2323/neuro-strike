@@ -19,6 +19,7 @@ htmlcov/
 
 # Local runtime artifacts
 .mplcache/
+uploads/
 *.log
 
 # OS / editor files

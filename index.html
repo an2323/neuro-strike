@@ -52,6 +52,58 @@
         flex-wrap: wrap;
         margin-bottom: 12px;
       }
+      .server-config {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 12px;
+        padding: 10px;
+        background: var(--card);
+        border: 1px solid #24392e;
+        border-radius: 10px;
+      }
+      .server-config label {
+        color: var(--muted);
+        font-size: 0.85rem;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .server-config input {
+        flex: 1;
+        min-width: 140px;
+        background: #0c1010;
+        border: 1px solid #2d4537;
+        border-radius: 8px;
+        color: var(--text);
+        padding: 8px 12px;
+        font-family: "Courier New", monospace;
+        font-size: 0.9rem;
+      }
+      .server-config input:focus {
+        outline: none;
+        border-color: var(--neon);
+      }
+      .server-config button {
+        padding: 8px 16px;
+      }
+      .connection-indicator {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin-right: 6px;
+      }
+      .connection-indicator.local {
+        background: #ffd166;
+        box-shadow: 0 0 8px #ffd166;
+      }
+      .connection-indicator.remote {
+        background: var(--neon);
+        box-shadow: 0 0 8px var(--neon);
+      }
+      .connection-indicator.disconnected {
+        background: #666;
+      }
       .title {
         font-size: 1.1rem;
         letter-spacing: 0.04em;
@@ -82,6 +134,14 @@
         background: #173625;
         border-color: #2f855f;
       }
+      #connectBtn {
+        background: #173625;
+        border-color: #2f855f;
+      }
+      #connectBtn.connected {
+        background: #3a1a1a;
+        border-color: #ff3f5f;
+      }
       .stage {
         position: relative;
         border-radius: 12px;
@@ -89,14 +149,26 @@
         border: 1px solid #22392d;
         background: black;
       }
+      .video-wrap {
+        position: relative;
+        width: 100%;
+        max-height: 62vh;
+        line-height: 0;
+        background: #000;
+      }
       video {
         width: 100%;
         max-height: 62vh;
+        height: auto;
         display: block;
+        object-fit: contain;
+        vertical-align: top;
+        background: #000;
       }
       canvas#overlayCanvas {
         position: absolute;
-        inset: 0;
+        left: 0;
+        top: 0;
         width: 100%;
         height: 100%;
         pointer-events: none;
@@ -117,7 +189,7 @@
       .metrics-panel {
         padding: 16px;
         display: grid;
-        grid-template-rows: repeat(5, min-content);
+        grid-template-rows: repeat(6, min-content);
         gap: 12px;
         align-content: start;
       }
@@ -137,6 +209,23 @@
         margin-top: 4px;
         font-size: 1.45rem;
         font-weight: 700;
+      }
+      .latency-sub {
+        font-size: 0.75rem;
+        color: var(--muted);
+        margin-top: 6px;
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .latency-sub span {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .latency-sub .num {
+        color: var(--text);
+        font-weight: 600;
       }
       .muted-indicator {
         color: #ffd166;
@@ -166,14 +255,46 @@
             <button id="startBtn">Start Training</button>
             <button id="stopBtn" disabled>Stop</button>
             <button id="muteBtn" disabled>Mute</button>
+            <button id="uploadBtn">Video Upload</button>
+            <input
+              id="videoFileInput"
+              type="file"
+              accept=".mp4,video/mp4"
+              style="display: none"
+            />
           </div>
         </div>
+
+        <!-- AMD Server Connection Configuration -->
+        <div class="server-config">
+          <label>AMD Server IP</label>
+          <input
+            id="serverIpInput"
+            type="text"
+            value="165.245.131.174"
+            placeholder="e.g. 165.245.131.174"
+          />
+          <button id="connectBtn">Connect</button>
+          <span
+            id="connectionStatus"
+            style="font-size: 0.85rem; color: var(--muted)"
+          >
+            <span
+              class="connection-indicator disconnected"
+              id="connIndicator"
+            ></span>
+            <span id="connLabel">Disconnected</span>
+          </span>
+        </div>
+
         <div class="stage">
-          <video id="video" playsinline muted></video>
-          <canvas id="overlayCanvas"></canvas>
+          <div class="video-wrap">
+            <video id="video" playsinline muted></video>
+            <canvas id="overlayCanvas"></canvas>
+          </div>
         </div>
         <div class="chart-panel">
-          <div class="chart-title">Posture Consistency (0-100)</div>
+          <div class="chart-title">Leg Power / Velocity (0-100)</div>
           <canvas id="scoreChart"></canvas>
         </div>
       </section>
@@ -184,11 +305,17 @@
           <div id="status" class="value status-ok">IDLE</div>
         </div>
         <div class="metric-card">
-          <div class="label">Latency</div>
+          <div class="label">Latency Monitor</div>
           <div id="latency" class="value">- ms</div>
+          <div class="latency-sub">
+            <span>Min: <span id="latMin" class="num">-</span> ms</span>
+            <span>Max: <span id="latMax" class="num">-</span> ms</span>
+            <span>Avg: <span id="latAvg" class="num">-</span> ms</span>
+            <span>KB/frame: <span id="kbPerFrame" class="num">-</span></span>
+          </div>
         </div>
         <div class="metric-card">
-          <div class="label">Posture Score</div>
+          <div class="label">Kick Velocity</div>
           <div id="score" class="value">0</div>
         </div>
         <div class="metric-card">
@@ -206,9 +333,15 @@
       const startBtn = document.getElementById("startBtn");
       const stopBtn = document.getElementById("stopBtn");
       const muteBtn = document.getElementById("muteBtn");
+      const uploadBtn = document.getElementById("uploadBtn");
+      const videoFileInput = document.getElementById("videoFileInput");
       const muteIndicator = document.getElementById("muteIndicator");
       const statusEl = document.getElementById("status");
       const latencyEl = document.getElementById("latency");
+      const latMinEl = document.getElementById("latMin");
+      const latMaxEl = document.getElementById("latMax");
+      const latAvgEl = document.getElementById("latAvg");
+      const kbPerFrameEl = document.getElementById("kbPerFrame");
       const scoreEl = document.getElementById("score");
       const sessionTimeEl = document.getElementById("sessionTime");
       const video = document.getElementById("video");
@@ -217,6 +350,12 @@
       const captureCanvas = document.createElement("canvas");
       const captureCtx = captureCanvas.getContext("2d");
       const chartCanvas = document.getElementById("scoreChart");
+
+      // AMD Server connection elements
+      const serverIpInput = document.getElementById("serverIpInput");
+      const connectBtn = document.getElementById("connectBtn");
+      const connIndicator = document.getElementById("connIndicator");
+      const connLabel = document.getElementById("connLabel");
 
       let ws;
       let audioCtx;
@@ -229,9 +368,26 @@
       let sessionStartTs = null;
       let sessionTicker = null;
       let scoreChart;
+      let selectedVideoFile = null;
+      let uploadedVideoId = null;
+      let activeMode = "WEBCAM";
+      let frameSeq = 0;
+      let pumpGeneration = 0;
 
-      const targetFps = 12;
-      const frameIntervalMs = Math.floor(1000 / targetFps);
+      // Remote connection state
+      let remoteServerIp = "";
+      let isRemoteConnected = false;
+      let remoteWsUrl = "";
+
+      // Capture dimensions (must match startFramePump)
+      const CAPTURE_W = 640;
+      const CAPTURE_H = 360;
+
+      // Latency tracking
+      let latencySamples = [];
+      let bytesPerFrame = 0;
+      const MAX_LATENCY_SAMPLES = 100;
+
       const indexToName = {
         11: "LEFT_SHOULDER",
         12: "RIGHT_SHOULDER",
@@ -241,6 +397,12 @@
         16: "RIGHT_WRIST",
         23: "LEFT_HIP",
         24: "RIGHT_HIP",
+        25: "LEFT_KNEE",
+        26: "RIGHT_KNEE",
+        27: "LEFT_ANKLE",
+        28: "RIGHT_ANKLE",
+        31: "LEFT_FOOT_INDEX",
+        32: "RIGHT_FOOT_INDEX",
       };
       const skeletalConnections = [
         [11, 12],
@@ -251,6 +413,12 @@
         [11, 23],
         [12, 24],
         [23, 24],
+        [23, 25],
+        [25, 27],
+        [27, 31],
+        [24, 26],
+        [26, 28],
+        [28, 32],
       ];
 
       function formatDuration(ms) {
@@ -265,6 +433,107 @@
         statusEl.className = `value ${isNeutral ? "status-neutral" : isAlarm ? "status-alarm" : "status-ok"}`;
       }
 
+      // ---- Latency Monitor ----
+      function recordLatency(rtt) {
+        latencySamples.push(rtt);
+        if (latencySamples.length > MAX_LATENCY_SAMPLES) {
+          latencySamples.shift();
+        }
+        const min = Math.min(...latencySamples);
+        const max = Math.max(...latencySamples);
+        const avg =
+          latencySamples.reduce((a, b) => a + b, 0) / latencySamples.length;
+        latencyEl.textContent = `${Math.round(rtt)} ms`;
+        latMinEl.textContent = Math.round(min);
+        latMaxEl.textContent = Math.round(max);
+        latAvgEl.textContent = Math.round(avg);
+      }
+
+      function resetLatencyMonitor() {
+        latencySamples = [];
+        bytesPerFrame = 0;
+        latencyEl.textContent = "- ms";
+        latMinEl.textContent = "-";
+        latMaxEl.textContent = "-";
+        latAvgEl.textContent = "-";
+        kbPerFrameEl.textContent = "-";
+      }
+
+      // ---- Remote Connection Management ----
+      function updateConnectionUI(connected) {
+        isRemoteConnected = connected;
+        if (connected) {
+          connIndicator.className = "connection-indicator remote";
+          connLabel.textContent = `Connected to ${remoteServerIp}`;
+          connectBtn.textContent = "Disconnect";
+          connectBtn.classList.add("connected");
+          serverIpInput.disabled = true;
+        } else {
+          connIndicator.className = "connection-indicator disconnected";
+          connLabel.textContent = "Disconnected";
+          connectBtn.textContent = "Connect";
+          connectBtn.classList.remove("connected");
+          serverIpInput.disabled = false;
+        }
+      }
+
+      function getWsUrl() {
+        if (isRemoteConnected && remoteWsUrl) {
+          return remoteWsUrl;
+        }
+        // Fallback to local
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        return `${proto}://${location.host}/ws`;
+      }
+
+      function connectToRemote() {
+        const ip = serverIpInput.value.trim();
+        if (!ip) {
+          alert("Please enter a valid AMD Server IP address");
+          return;
+        }
+        remoteServerIp = ip;
+        remoteWsUrl = `ws://${ip}:8080/ws`;
+
+        // If already connected to remote, disconnect first
+        if (isRemoteConnected) {
+          disconnectFromRemote();
+          return;
+        }
+
+        // Test the connection by trying to reach the health endpoint
+        fetch(`http://${ip}:8080/health`, { mode: "no-cors" })
+          .then(() => {
+            updateConnectionUI(true);
+            setStatus("REMOTE_READY", false, true);
+          })
+          .catch(() => {
+            // Even if fetch fails (CORS), we still allow WebSocket connection
+            updateConnectionUI(true);
+            setStatus("REMOTE_READY", false, true);
+          });
+      }
+
+      function disconnectFromRemote() {
+        // Stop training if running
+        if (streamRunning) {
+          stopTraining();
+        }
+        // Close any existing WebSocket
+        if (ws) {
+          try {
+            ws.close();
+          } catch (_) {}
+          ws = null;
+        }
+        remoteServerIp = "";
+        remoteWsUrl = "";
+        updateConnectionUI(false);
+        setStatus("IDLE", false, true);
+        resetLatencyMonitor();
+      }
+
+      // ---- Audio ----
       function initAudio() {
         if (audioCtx) return;
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -301,6 +570,7 @@
         gainNode.gain.setTargetAtTime(0.18, now, 0.01);
       }
 
+      // ---- Chart ----
       function initChart() {
         scoreChart = new Chart(chartCanvas, {
           type: "line",
@@ -308,7 +578,7 @@
             labels: [],
             datasets: [
               {
-                label: "Posture Consistency",
+                label: "Leg Power / Velocity",
                 data: [],
                 borderColor: "#39ff88",
                 backgroundColor: "rgba(57,255,136,0.15)",
@@ -345,7 +615,7 @@
         sessionStartTs = Date.now();
         sessionTimeEl.textContent = "00:00";
         scoreEl.textContent = "0";
-        latencyEl.textContent = "- ms";
+        resetLatencyMonitor();
         if (scoreChart) {
           scoreChart.data.labels = [];
           scoreChart.data.datasets[0].data = [];
@@ -365,11 +635,78 @@
         scoreChart.update("none");
       }
 
+      async function uploadVideoIfNeeded() {
+        if (!selectedVideoFile) return null;
+        if (uploadedVideoId) return uploadedVideoId;
+        const formData = new FormData();
+        formData.append("file", selectedVideoFile);
+        const response = await fetch("/upload-video", {
+          method: "POST",
+          body: formData,
+        });
+        if (!response.ok) {
+          throw new Error("Video upload failed");
+        }
+        const data = await response.json();
+        uploadedVideoId = data.video_file_id;
+        return uploadedVideoId;
+      }
+
+      /** Map intrinsic video pixels → overlay canvas CSS pixels (handles object-fit: contain letterboxing). */
+      function getVideoContentBox() {
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        const cw = video.clientWidth;
+        const ch = video.clientHeight;
+        if (!vw || !vh || !cw || !ch) return null;
+        const vr = vw / vh;
+        const cr = cw / ch;
+        let dispW;
+        let dispH;
+        let ox;
+        let oy;
+        if (vr > cr) {
+          dispW = cw;
+          dispH = cw / vr;
+          ox = 0;
+          oy = (ch - dispH) / 2;
+        } else {
+          dispH = ch;
+          dispW = ch * vr;
+          ox = (cw - dispW) / 2;
+          oy = 0;
+        }
+        return { vw, vh, ox, oy, dispW, dispH, cw, ch };
+      }
+
+      function resizeOverlayCanvas() {
+        const cw = Math.max(1, Math.round(video.clientWidth));
+        const ch = Math.max(1, Math.round(video.clientHeight));
+        if (overlayCanvas.width !== cw || overlayCanvas.height !== ch) {
+          overlayCanvas.width = cw;
+          overlayCanvas.height = ch;
+        }
+      }
+
+      function mapPointToOverlay(pt, box) {
+        return {
+          x: box.ox + (pt.x / box.vw) * box.dispW,
+          y: box.oy + (pt.y / box.vh) * box.dispH,
+        };
+      }
+
       function drawSkeleton(points, isAlarm) {
-        const color = isAlarm ? "rgba(255, 63, 95, 0.75)" : "rgba(57, 255, 136, 0.75)";
+        const box = getVideoContentBox();
+        if (!box) return;
+
+        const color = isAlarm
+          ? "rgba(255, 63, 95, 0.75)"
+          : "rgba(57, 255, 136, 0.75)";
         const indexedLandmarks = {};
         Object.entries(indexToName).forEach(([idx, name]) => {
-          if (points[name]) indexedLandmarks[Number(idx)] = points[name];
+          const p = points[name];
+          if (!p) return;
+          indexedLandmarks[Number(idx)] = mapPointToOverlay(p, box);
         });
 
         overlayCtx.lineWidth = 3;
@@ -396,37 +733,57 @@
         overlayCtx.shadowBlur = 0;
       }
 
-      function getWsUrl() {
-        const proto = location.protocol === "https:" ? "wss" : "ws";
-        return `${proto}://${location.host}/ws`;
-      }
-
+      // ---- WebSocket ----
       function connectWebSocket() {
         if (!streamRunning) return;
-        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+        if (
+          ws &&
+          (ws.readyState === WebSocket.OPEN ||
+            ws.readyState === WebSocket.CONNECTING)
+        )
+          return;
 
         setStatus("CONNECTING", false, true);
         ws = new WebSocket(getWsUrl());
 
-        ws.onopen = () => setStatus("READY", false);
+        ws.onopen = () => {
+          setStatus("READY", false);
+          startFramePump();
+        };
         ws.onmessage = (event) => {
           const data = JSON.parse(event.data);
           const rtt = data.client_ts ? Date.now() - data.client_ts : 0;
-          latencyEl.textContent = `${rtt} ms`;
+          recordLatency(rtt);
           const score = Number(data.posture_consistency_score ?? 0);
           scoreEl.textContent = String(Math.round(score));
           appendScore(score);
 
+          // Scale keypoints from capture space (640x360) to video pixel space
+          if (data.keypoints && video.videoWidth > 0 && video.videoHeight > 0) {
+            const sx = video.videoWidth / CAPTURE_W;
+            const sy = video.videoHeight / CAPTURE_H;
+            for (const name in data.keypoints) {
+              const kp = data.keypoints[name];
+              kp.x *= sx;
+              kp.y *= sy;
+            }
+          }
+
           const status = String(data.status || "").toUpperCase();
           const isAlarm = status === "ALARM" || status === "BAD";
-          const isNeutral = status === "NO_POSE" || status === "CALIBRATING" || status === "CONNECTING";
+          const isNeutral =
+            status === "NO_POSE" ||
+            status === "CALIBRATING" ||
+            status === "CONNECTING";
           setStatus(status, isAlarm, isNeutral);
           playFeedback(isAlarm, isNeutral);
           lastResult = data;
           sendingInFlight = false;
+          kbPerFrameEl.textContent = (bytesPerFrame / 1024).toFixed(1);
         };
         ws.onclose = () => {
           if (!streamRunning) return;
+          stopFramePump();
           setStatus("DISCONNECTED", true, true);
           sendingInFlight = false;
           reconnectTimer = setTimeout(connectWebSocket, 1500);
@@ -434,18 +791,90 @@
         ws.onerror = () => setStatus("ERROR", true, true);
       }
 
-      async function sendFrameLoop() {
-        while (streamRunning) {
-          const t0 = performance.now();
-          if (ws && ws.readyState === WebSocket.OPEN && !sendingInFlight) {
-            sendingInFlight = true;
-            const clientTs = Date.now();
-            captureCtx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
-            const frameData = captureCanvas.toDataURL("image/jpeg", 0.55);
-            ws.send(JSON.stringify({ frame: frameData, client_ts: clientTs }));
+      function stopFramePump() {
+        pumpGeneration++;
+      }
+
+      /** Capture frame at reduced resolution with heavy JPEG compression. */
+      function captureFrame(width, height, quality) {
+        return new Promise((resolve) => {
+          captureCanvas.width = width;
+          captureCanvas.height = height;
+          captureCtx.drawImage(video, 0, 0, width, height);
+          captureCanvas.toBlob((blob) => resolve(blob), "image/jpeg", quality);
+        });
+      }
+
+      /**
+       * Frame pump with all optimizations:
+       * - Downscale to 640x360 before sending
+       * - Heavy JPEG compression (30%)
+       * - Smart frame dropping (skip if previous still in flight)
+       * - Binary transfer via WebSocket (no base64 overhead)
+       */
+      function startFramePump() {
+        pumpGeneration++;
+        const gen = pumpGeneration;
+        const JPEG_QUALITY = 0.3;
+
+        async function tick() {
+          if (!streamRunning || gen !== pumpGeneration) return;
+
+          if (
+            ws &&
+            ws.readyState === WebSocket.OPEN &&
+            video.videoWidth > 0 &&
+            video.videoHeight > 0
+          ) {
+            // Smart frame dropping: skip if previous frame is still being processed
+            if (!sendingInFlight) {
+              sendingInFlight = true;
+              try {
+                // Downscale + heavy compression
+                const blob = await captureFrame(
+                  CAPTURE_W,
+                  CAPTURE_H,
+                  JPEG_QUALITY,
+                );
+
+                // Build binary message: [4-byte JSON header length][JSON header][JPEG bytes]
+                const header = JSON.stringify({
+                  mode: activeMode,
+                  client_ts: Date.now(),
+                  frame_seq: frameSeq++,
+                });
+                const headerBytes = new TextEncoder().encode(header);
+                const headerLen = new Uint32Array([headerBytes.length]);
+                const blobBytes = new Uint8Array(await blob.arrayBuffer());
+
+                const msg = new Uint8Array(
+                  4 + headerBytes.length + blobBytes.length,
+                );
+                msg.set(new Uint8Array(headerLen.buffer), 0);
+                msg.set(headerBytes, 4);
+                msg.set(blobBytes, 4 + headerBytes.length);
+
+                ws.send(msg.buffer);
+
+                // Track payload size for KB/frame stats
+                bytesPerFrame = msg.length;
+              } catch (e) {
+                sendingInFlight = false;
+              }
+            }
           }
-          const elapsed = performance.now() - t0;
-          await new Promise((resolve) => setTimeout(resolve, Math.max(0, frameIntervalMs - elapsed)));
+
+          if (!streamRunning || gen !== pumpGeneration) return;
+          if (typeof video.requestVideoFrameCallback === "function") {
+            video.requestVideoFrameCallback(tick);
+          } else {
+            requestAnimationFrame(tick);
+          }
+        }
+        if (typeof video.requestVideoFrameCallback === "function") {
+          video.requestVideoFrameCallback(tick);
+        } else {
+          requestAnimationFrame(tick);
         }
       }
 
@@ -453,7 +882,9 @@
         if (sessionTicker) clearInterval(sessionTicker);
         sessionTicker = setInterval(() => {
           if (!streamRunning || !sessionStartTs) return;
-          sessionTimeEl.textContent = formatDuration(Date.now() - sessionStartTs);
+          sessionTimeEl.textContent = formatDuration(
+            Date.now() - sessionStartTs,
+          );
         }, 500);
       }
 
@@ -467,31 +898,32 @@
         stopBtn.disabled = false;
         muteBtn.disabled = false;
         setStatus("STARTING", false, true);
+        activeMode = selectedVideoFile ? "VIDEO_FILE" : "WEBCAM";
 
-        const media = await navigator.mediaDevices.getUserMedia({
-          video: { width: 960, height: 540, facingMode: "user" },
-          audio: false,
-        });
-        video.srcObject = media;
-        await video.play();
-
-        const width = video.videoWidth || 960;
-        const height = video.videoHeight || 540;
-        overlayCanvas.width = width;
-        overlayCanvas.height = height;
-        captureCanvas.width = width;
-        captureCanvas.height = height;
+        if (activeMode === "WEBCAM") {
+          const media = await navigator.mediaDevices.getUserMedia({
+            video: { width: 960, height: 540, facingMode: "user" },
+            audio: false,
+          });
+          video.srcObject = media;
+          await video.play();
+        } else {
+          video.srcObject = null;
+          video.src = URL.createObjectURL(selectedVideoFile);
+          video.muted = true;
+          await video.play();
+        }
 
         streamRunning = true;
         startSessionClock();
         requestAnimationFrame(drawLoop);
-        sendFrameLoop();
         connectWebSocket();
       }
 
       function stopTraining() {
         if (!streamRunning) return;
         streamRunning = false;
+        stopFramePump();
         sendingInFlight = false;
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -508,6 +940,11 @@
           video.srcObject.getTracks().forEach((t) => t.stop());
           video.srcObject = null;
         }
+        if (video.src) {
+          video.pause();
+          video.removeAttribute("src");
+          video.load();
+        }
 
         overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
         setStatus("IDLE", false, true);
@@ -519,6 +956,7 @@
       let lastResult = null;
       function drawLoop() {
         if (!streamRunning) return;
+        resizeOverlayCanvas();
         overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
         if (lastResult && lastResult.keypoints) {
           const status = String(lastResult.status || "").toUpperCase();
@@ -528,6 +966,7 @@
         requestAnimationFrame(drawLoop);
       }
 
+      // ---- Event Listeners ----
       startBtn.addEventListener("click", () => {
         startTraining().catch((err) => {
           console.error(err);
@@ -543,6 +982,30 @@
         } catch (_err) {}
         isMuted = !isMuted;
         updateMuteUi();
+      });
+      uploadBtn.addEventListener("click", () => videoFileInput.click());
+      videoFileInput.addEventListener("change", () => {
+        const file = videoFileInput.files && videoFileInput.files[0];
+        selectedVideoFile = file || null;
+        uploadedVideoId = null;
+        uploadBtn.textContent = selectedVideoFile
+          ? `Video: ${selectedVideoFile.name}`
+          : "Video Upload";
+      });
+
+      // AMD Server Connect/Disconnect
+      connectBtn.addEventListener("click", connectToRemote);
+
+      // Allow Enter key in IP input to trigger connect
+      serverIpInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          connectToRemote();
+        }
+      });
+
+      window.addEventListener("resize", () => {
+        if (streamRunning) resizeOverlayCanvas();
       });
 
       initChart();

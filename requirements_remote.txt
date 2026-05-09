@@ -1,0 +1,17 @@
+# NeuroStrike Remote Backend - AMD MI300X Dependencies
+# Linux-optimized packages for cloud deployment
+# NOTE: Install opencv-python-headless BEFORE mediapipe to prevent
+#       mediapipe from pulling in opencv-contrib-python (GUI version)
+
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+websockets==12.0
+
+# Computer Vision & AI
+mediapipe==0.10.13
+opencv-python-headless==4.9.0.80
+numpy<2.0.0  # mediapipe requires numpy<2.0.0
+
+# Utilities
+python-multipart==0.0.6
