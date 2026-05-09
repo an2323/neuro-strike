@@ -395,6 +395,10 @@
           this._lastSpoken = null;
         }
 
+        /**
+         * Web Speech API has no explicit queue API; cancel() clears pending
+         * utterances. We cancel then speak on the next tick to avoid cancel/speak races.
+         */
         speak(text) {
           if (!this.supported || text == null) {
             return;
@@ -408,9 +412,14 @@
           }
           this._lastSpoken = s;
           window.speechSynthesis.cancel();
-          const u = new SpeechSynthesisUtterance(s);
-          u.lang = "en-US";
-          window.speechSynthesis.speak(u);
+          window.setTimeout(() => {
+            if (!this.supported) return;
+            try {
+              const u = new SpeechSynthesisUtterance(s);
+              u.lang = "en-US";
+              window.speechSynthesis.speak(u);
+            } catch (_) {}
+          }, 0);
         }
       }
 
