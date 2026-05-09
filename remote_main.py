@@ -10,9 +10,10 @@ import struct
 import time
 import logging
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 from contextlib import asynccontextmanager
 
 # Enable AMD ROCm GPU acceleration for MI300X
@@ -207,12 +208,19 @@ class AnalyzerConfig:
     # Hip-relative ankle speed (px/s); whole-body motion (jumps) largely cancels out.
     alarm_speed_threshold_px_s: float = 90.0
     fast_motion_threshold_px: float = 12.0
-    # Knee extending toward straight: positive d(angle)/dt (deg/s).
-    knee_extension_rate_threshold_deg_s: float = 160.0
     # Ankle must be at least this many pixels below mid-hip (image y grows downward).
     strike_ankle_below_midhip_margin_px: float = 8.0
-    # Consecutive frames with strike_candidate before voice_feedback fires.
-    voice_strike_consecutive_frames: int = 2
+    # Event-based strike FSM (see process_strike_event_fsm).
+    strike_fsm_min_peak_speed_px_s: float = 90.0
+    strike_peak_drop_ratio: float = 0.12  # impact when speed falls this fraction below running peak
+    strike_backswing_knee_drop_deg: float = 14.0  # min drop (max→now) over recent window for a leg
+    strike_prep_speed_entry_px_s: float = 42.0  # enter STRIKING when track-leg rel speed exceeds this
+    strike_prep_max_frames: int = 28  # abort PREPARING → IDLE
+    strike_striking_max_frames: int = 40  # abort STRIKING without peak → IDLE
+    strike_history_maxlen: int = 20
+    strike_post_event_frames: int = 15  # analyze last N frames at impact
+    strike_linear_corr_min: float = 0.68  # Pearson r (time vs speed) before peak for "linear" buildup
+    strike_stable_hip_std_max: float = 5.5  # std of hip tilt over post-event window for "stable"
 
 
 def point_speed_px_per_sec(
@@ -525,10 +533,15 @@ class FootballAnalyzer:
         kicking_leg = "LEFT" if left_rel >= right_rel else "RIGHT"
         kick_speed = left_rel if kicking_leg == "LEFT" else right_rel
 
+        lh, lk, la = keypoints.get("LEFT_HIP"), keypoints.get("LEFT_KNEE"), keypoints.get("LEFT_ANKLE")
+        rh, rk, ra = keypoints.get("RIGHT_HIP"), keypoints.get("RIGHT_KNEE"), keypoints.get("RIGHT_ANKLE")
+        left_knee_angle = self._joint_angle_deg(lh, lk, la) if lh and lk and la else 180.0
+        right_knee_angle = self._joint_angle_deg(rh, rk, ra) if rh and rk and ra else 180.0
+
         if kicking_leg == "LEFT":
-            hip, knee, ankle = keypoints.get("LEFT_HIP"), keypoints.get("LEFT_KNEE"), keypoints.get("LEFT_ANKLE")
+            hip, knee, ankle = lh, lk, la
         else:
-            hip, knee, ankle = keypoints.get("RIGHT_HIP"), keypoints.get("RIGHT_KNEE"), keypoints.get("RIGHT_ANKLE")
+            hip, knee, ankle = rh, rk, ra
         knee_angle = self._joint_angle_deg(hip, knee, ankle) if hip and knee and ankle else 180.0
 
         def _leg_knee_angle_deg(kp: Dict[str, Dict[str, float]], side: str) -> float:
@@ -547,6 +560,10 @@ class FootballAnalyzer:
         if hip_tilt_deg > 90.0:
             hip_tilt_deg = abs(180.0 - hip_tilt_deg)
 
+        vertical_ok = ankle_below_mid_hip(
+            keypoints, kicking_leg, self.config.strike_ankle_below_midhip_margin_px
+        )
+
         unstable_hip = hip_tilt_deg > self.config.hip_tilt_threshold_deg
         bad_knee = knee_angle < self.config.knee_min_deg or knee_angle > self.config.knee_max_deg
         is_alarm = kick_speed > self.config.alarm_speed_threshold_px_s and (unstable_hip or bad_knee)
@@ -556,29 +573,9 @@ class FootballAnalyzer:
         if status == "ALARM":
             velocity_score = min(velocity_score, 55.0)
 
-        thresh = self.config.alarm_speed_threshold_px_s
-        speed_ok = prev_keypoints is not None and kick_speed > thresh
-        vertical_ok = ankle_below_mid_hip(
-            keypoints, kicking_leg, self.config.strike_ankle_below_midhip_margin_px
-        )
-        extension_ok = (
-            prev_knee is not None
-            and knee_extension_rate >= self.config.knee_extension_rate_threshold_deg_s
-        )
-        strike_candidate = bool(speed_ok and vertical_ok and extension_ok)
-
-        voice_feedback_raw: Optional[str] = None
-        if strike_candidate:
-            if hip_tilt_deg > self.config.hip_tilt_threshold_deg:
-                voice_feedback_raw = "Lean forward"
-            elif knee_angle > self.config.knee_max_deg:
-                voice_feedback_raw = "Bend your knee"
-            else:
-                voice_feedback_raw = "Great strike"
-
         print(
             f"Debug: Speed={kick_speed:.1f} Ext={knee_extension_rate:.1f} "
-            f"Found=True SpeedOK={speed_ok} VertOK={vertical_ok} ExtOK={extension_ok}"
+            f"Found=True knee_L={left_knee_angle:.0f} knee_R={right_knee_angle:.0f} leg={kicking_leg}"
         )
 
         return {
@@ -596,14 +593,12 @@ class FootballAnalyzer:
                 "left_ankle_abs_speed_px_s": round(float(left_abs), 2),
                 "right_ankle_abs_speed_px_s": round(float(right_abs), 2),
                 "knee_extension_rate_deg_s": round(float(knee_extension_rate), 1),
-                "strike_speed_ok": speed_ok,
-                "strike_vertical_ok": vertical_ok,
-                "strike_extension_ok": extension_ok,
-                "strike_candidate": strike_candidate,
+                "left_knee_angle_deg": round(float(left_knee_angle), 1),
+                "right_knee_angle_deg": round(float(right_knee_angle), 1),
+                "strike_ankle_below_hip": vertical_ok,
                 "fast_motion_mode": fast_motion,
             },
             "voice_feedback": None,
-            "voice_feedback_raw": voice_feedback_raw,
             "chosen_centroid": chosen_centroid,
             "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
             "smoothed_keypoints": keypoints,
@@ -620,6 +615,162 @@ class FootballAnalyzer:
 
 
 # ---------------------------------------------------------------------------
+# Event-based strike FSM (session-local; ignores steady-state "running" pose)
+# ---------------------------------------------------------------------------
+
+def _strike_knee(sample: Dict, leg: str) -> float:
+    return float(sample["knee_l"] if leg == "LEFT" else sample["knee_r"])
+
+
+def _strike_sp(sample: Dict, leg: str) -> float:
+    return float(sample["sp_l"] if leg == "LEFT" else sample["sp_r"])
+
+
+def _detect_backswing_leg(history: Deque[Dict], min_drop_deg: float) -> Optional[str]:
+    """Return which leg shows a clear cocking (knee angle drop) over the recent window."""
+    if len(history) < 6:
+        return None
+    window = list(history)[-6:]
+    best_leg: Optional[str] = None
+    best_drop = 0.0
+    for leg in ("LEFT", "RIGHT"):
+        knees = [_strike_knee(h, leg) for h in window]
+        drop = float(max(knees) - knees[-1])
+        if drop >= min_drop_deg and drop > best_drop:
+            best_drop = drop
+            best_leg = leg
+    return best_leg
+
+
+def _analyze_strike_sequence(
+    frames: List[Dict], track_leg: str, cfg: AnalyzerConfig
+) -> str:
+    """Post-event: last N frames — prefer Lean forward on bad hip at peak, else Great strike."""
+    if not frames:
+        return "Great strike"
+    sps = [_strike_sp(f, track_leg) for f in frames]
+    idx_peak = int(np.argmax(np.array(sps, dtype=np.float64)))
+    hip_peak = float(frames[idx_peak]["hip"])
+    if hip_peak > cfg.hip_tilt_threshold_deg:
+        return "Lean forward"
+    seg = np.array(sps[: idx_peak + 1], dtype=np.float64)
+    if seg.size >= 5:
+        t = np.arange(seg.size, dtype=np.float64)
+        c = np.corrcoef(t, seg)[0, 1]
+        hips = [float(f["hip"]) for f in frames[: idx_peak + 1]]
+        hip_std = float(np.std(hips)) if hips else 99.0
+        if not np.isnan(c) and c >= cfg.strike_linear_corr_min and hip_std <= cfg.strike_stable_hip_std_max:
+            return "Great strike"
+    return "Great strike"
+
+
+def process_strike_event_fsm(session: "SessionState", result: Dict, cfg: AnalyzerConfig) -> Optional[str]:
+    """
+    IDLE → PREPARING (backswing) → STRIKING (build-up) → impact on relative-speed local peak.
+    Voice only fires once per completed strike event (post-hoc phrase from recent window).
+    """
+    if result.get("status") != "OK":
+        session.strike_history.clear()
+        session.strike_phase = "IDLE"
+        session.strike_track_leg = None
+        session.strike_peak_speed = 0.0
+        session.strike_saw_backswing = False
+        session.strike_phase_frames = 0
+        result.setdefault("metrics", {})["strike_phase"] = "IDLE"
+        return None
+
+    m = result.get("metrics") or {}
+    sample = {
+        "ts": int(result.get("timestamp_ms", 0)),
+        "knee_l": float(m.get("left_knee_angle_deg", 180.0)),
+        "knee_r": float(m.get("right_knee_angle_deg", 180.0)),
+        "sp_l": float(m.get("left_ankle_speed_px_s", 0.0)),
+        "sp_r": float(m.get("right_ankle_speed_px_s", 0.0)),
+        "hip": float(m.get("hip_tilt_deg", 0.0)),
+        "vertical_ok": bool(m.get("strike_ankle_below_hip", False)),
+        "dom_leg": str(result.get("kicking_leg", "LEFT")),
+    }
+    session.strike_history.append(sample)
+
+    voice_out: Optional[str] = None
+    phase = session.strike_phase
+    n_hist = len(session.strike_history)
+
+    if phase == "IDLE":
+        bl = _detect_backswing_leg(session.strike_history, cfg.strike_backswing_knee_drop_deg)
+        if bl is not None:
+            session.strike_phase = "PREPARING"
+            session.strike_track_leg = bl
+            session.strike_saw_backswing = True
+            session.strike_peak_speed = 0.0
+            session.strike_phase_frames = 0
+
+    elif phase == "PREPARING":
+        session.strike_phase_frames += 1
+        leg = session.strike_track_leg
+        if leg is None:
+            session.strike_phase = "IDLE"
+        elif session.strike_phase_frames > cfg.strike_prep_max_frames:
+            session.strike_phase = "IDLE"
+            session.strike_track_leg = None
+            session.strike_saw_backswing = False
+            session.strike_phase_frames = 0
+        else:
+            sp_tr = _strike_sp(sample, leg)
+            kn = _strike_knee(sample, leg)
+            prev = session.strike_history[-2] if n_hist >= 2 else sample
+            kn_prev = _strike_knee(prev, leg)
+            sp_prev = _strike_sp(prev, leg)
+            knee_extending = kn > kn_prev + 3.0
+            speed_rising = (
+                sp_tr >= cfg.strike_prep_speed_entry_px_s
+                and sp_prev >= cfg.strike_prep_speed_entry_px_s * 0.82
+            )
+            if knee_extending and speed_rising:
+                session.strike_phase = "STRIKING"
+                session.strike_peak_speed = max(sp_tr, sp_prev)
+                session.strike_phase_frames = 0
+
+    elif phase == "STRIKING":
+        session.strike_phase_frames += 1
+        leg = session.strike_track_leg
+        if leg is None:
+            session.strike_phase = "IDLE"
+        elif session.strike_phase_frames > cfg.strike_striking_max_frames:
+            session.strike_phase = "IDLE"
+            session.strike_track_leg = None
+            session.strike_saw_backswing = False
+            session.strike_peak_speed = 0.0
+            session.strike_phase_frames = 0
+        else:
+            sp_tr = _strike_sp(sample, leg)
+            session.strike_peak_speed = max(session.strike_peak_speed, sp_tr)
+            peak = session.strike_peak_speed
+            drop_ok = peak >= cfg.strike_fsm_min_peak_speed_px_s and sp_tr < peak * (1.0 - cfg.strike_peak_drop_ratio)
+            # Require a few frames of forward phase so a single noisy spike cannot "peak" instantly.
+            if session.strike_phase_frames < 4:
+                drop_ok = False
+            if (
+                drop_ok
+                and session.strike_saw_backswing
+                and sample.get("vertical_ok")
+            ):
+                n = min(len(session.strike_history), cfg.strike_post_event_frames)
+                window = list(session.strike_history)[-n:]
+                voice_out = _analyze_strike_sequence(window, leg, cfg)
+                session.strike_phase = "IDLE"
+                session.strike_track_leg = None
+                session.strike_peak_speed = 0.0
+                session.strike_saw_backswing = False
+                session.strike_phase_frames = 0
+                session.strike_history.clear()
+
+    result.setdefault("metrics", {})
+    result["metrics"]["strike_phase"] = session.strike_phase
+    return voice_out
+
+
+# ---------------------------------------------------------------------------
 # Connection pool & session management
 # ---------------------------------------------------------------------------
 
@@ -631,10 +782,15 @@ class SessionState:
     connection_id: str
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=SESSION_QUEUE_MAXSIZE))
     last_frame_time: float = 0.0
-    strike_voice_streak: int = 0
     sticky_centroid: Optional[Tuple[float, float]] = None
     sticky_miss_frames: int = 0
     no_pose_streak: int = 0
+    strike_history: Deque[Dict] = field(default_factory=lambda: deque(maxlen=22))
+    strike_phase: str = "IDLE"
+    strike_track_leg: Optional[str] = None
+    strike_peak_speed: float = 0.0
+    strike_saw_backswing: bool = False
+    strike_phase_frames: int = 0
 
 
 class ConnectionPool:
@@ -825,19 +981,12 @@ async def process_frame(
         else:
             session.sticky_miss_frames += 1
 
-        # ---- Strike voice debounce (2 consecutive frames) ----
-        raw_phrase = result.pop("voice_feedback_raw", None)
-        metrics = result.get("metrics") or {}
-        if metrics.get("strike_candidate"):
-            session.strike_voice_streak += 1
-        else:
-            session.strike_voice_streak = 0
+        # ---- Event-based strike voice (backswing → peak → post-hoc phrase) ----
+        strike_voice = process_strike_event_fsm(session, result, analyzer.config)
+        if strike_voice is not None:
+            result["voice_feedback"] = strike_voice
 
-        if raw_phrase is not None:
-            need = analyzer.config.voice_strike_consecutive_frames
-            result["voice_feedback"] = raw_phrase if session.strike_voice_streak == need else None
-
-        # ---- NO_POSE voice gating: only speak after 45 consecutive missing frames ----
+        # ---- NO_POSE voice gating ----
         if result.get("status") == "NO_POSE":
             session.no_pose_streak += 1
             if result.get("voice_feedback") is None and session.no_pose_streak > 20:
