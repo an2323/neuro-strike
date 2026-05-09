@@ -379,9 +379,9 @@
       let isRemoteConnected = false;
       let remoteWsUrl = "";
 
-      // Capture dimensions (must match startFramePump)
-      const CAPTURE_W = 640;
-      const CAPTURE_H = 360;
+      // Capture dimensions (must match startFramePump); higher res helps MediaPipe on distant subjects.
+      const CAPTURE_W = 1280;
+      const CAPTURE_H = 720;
 
       // Latency tracking
       let latencySamples = [];
@@ -770,6 +770,50 @@
         overlayCtx.shadowBlur = 0;
       }
 
+      function keypointBboxVideoPixels(points) {
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const name in points) {
+          const p = points[name];
+          if (!p || typeof p.x !== "number" || typeof p.y !== "number") continue;
+          minX = Math.min(minX, p.x);
+          maxX = Math.max(maxX, p.x);
+          minY = Math.min(minY, p.y);
+          maxY = Math.max(maxY, p.y);
+        }
+        if (!Number.isFinite(minX)) return null;
+        return { minX, minY, maxX, maxY };
+      }
+
+      /** Axis-aligned bbox in overlay CSS pixels (subject_filter rejects = red, tracked = green). */
+      function drawKeypointsBBoxOutline(points, strokeStyle, padPx = 6) {
+        const box = getVideoContentBox();
+        if (!box) return;
+        const bb = keypointBboxVideoPixels(points);
+        if (!bb) return;
+        const p1 = mapPointToOverlay(
+          { x: bb.minX - padPx, y: bb.minY - padPx },
+          box,
+        );
+        const p2 = mapPointToOverlay(
+          { x: bb.maxX + padPx, y: bb.maxY + padPx },
+          box,
+        );
+        overlayCtx.save();
+        overlayCtx.strokeStyle = strokeStyle;
+        overlayCtx.lineWidth = 2;
+        overlayCtx.setLineDash([]);
+        overlayCtx.strokeRect(
+          p1.x,
+          p1.y,
+          Math.max(1, p2.x - p1.x),
+          Math.max(1, p2.y - p1.y),
+        );
+        overlayCtx.restore();
+      }
+
       // ---- WebSocket ----
       function connectWebSocket() {
         if (!streamRunning) return;
@@ -800,14 +844,26 @@
           scoreEl.textContent = String(Math.round(score));
           appendScore(score);
 
-          // Scale keypoints from capture space (640x360) to video pixel space
-          if (data.keypoints && video.videoWidth > 0 && video.videoHeight > 0) {
+          // Scale keypoints from capture space to actual video pixel space
+          if (video.videoWidth > 0 && video.videoHeight > 0) {
             const sx = video.videoWidth / CAPTURE_W;
             const sy = video.videoHeight / CAPTURE_H;
-            for (const name in data.keypoints) {
-              const kp = data.keypoints[name];
-              kp.x *= sx;
-              kp.y *= sy;
+            if (data.keypoints) {
+              for (const name in data.keypoints) {
+                const kp = data.keypoints[name];
+                kp.x *= sx;
+                kp.y *= sy;
+              }
+            }
+            if (Array.isArray(data.debug_rejected_keypoints)) {
+              for (const pose of data.debug_rejected_keypoints) {
+                if (!pose) continue;
+                for (const name in pose) {
+                  const kp = pose[name];
+                  kp.x *= sx;
+                  kp.y *= sy;
+                }
+              }
             }
           }
 
@@ -849,7 +905,7 @@
 
       /**
        * Frame pump with all optimizations:
-       * - Downscale to 640x360 before sending
+       * - Downscale to CAPTURE_W x CAPTURE_H before sending (1280x720 for distant pose quality)
        * - Heavy JPEG compression (30%)
        * - Smart frame dropping (skip if previous still in flight)
        * - Binary transfer via WebSocket (no base64 overhead)
@@ -944,7 +1000,11 @@
 
         if (activeMode === "WEBCAM") {
           const media = await navigator.mediaDevices.getUserMedia({
-            video: { width: 960, height: 540, facingMode: "user" },
+            video: {
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              facingMode: "user",
+            },
             audio: false,
           });
           video.srcObject = media;
@@ -957,6 +1017,11 @@
         }
 
         streamRunning = true;
+        video.onplay = () => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "reset_session" }));
+          }
+        };
         startSessionClock();
         requestAnimationFrame(drawLoop);
         connectWebSocket();
@@ -964,6 +1029,7 @@
 
       function stopTraining() {
         if (!streamRunning) return;
+        video.onplay = null;
         streamRunning = false;
         stopFramePump();
         sendingInFlight = false;
@@ -1000,10 +1066,25 @@
         if (!streamRunning) return;
         resizeOverlayCanvas();
         overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-        if (lastResult && lastResult.keypoints) {
+        if (lastResult) {
+          const rejected = lastResult.debug_rejected_keypoints;
+          if (Array.isArray(rejected)) {
+            for (const pose of rejected) {
+              if (pose && typeof pose === "object") {
+                drawKeypointsBBoxOutline(pose, "rgba(255, 48, 48, 0.95)");
+              }
+            }
+          }
           const status = String(lastResult.status || "").toUpperCase();
           const isAlarm = status === "ALARM" || status === "BAD";
-          drawSkeleton(lastResult.keypoints, isAlarm);
+          const tracked = status === "OK" || status === "ALARM";
+          if (tracked && lastResult.keypoints) {
+            drawKeypointsBBoxOutline(
+              lastResult.keypoints,
+              "rgba(57, 255, 136, 0.95)",
+            );
+            drawSkeleton(lastResult.keypoints, isAlarm);
+          }
         }
         requestAnimationFrame(drawLoop);
       }

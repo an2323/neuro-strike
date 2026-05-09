@@ -54,10 +54,12 @@ _POSE_TASK_MODEL_PATH = _MODEL_DIR / "pose_landmarker_lite.task"
 # Ankles + foot indices (same as BlazePose / legacy Pose)
 _FOOT_LANDMARK_IDX: Tuple[int, ...] = (27, 28, 31, 32)
 
-# Normalized bbox height (max_y - min_y); above this ⇒ foreground / coach-sized — exclude.
-POSE_MAX_NORMALIZED_HEIGHT = 0.5
+# Normalized bbox height (max_y - min_y); above this ⇒ foreground / coach — excluded entirely (no fallback).
+POSE_MAX_NORMALIZED_HEIGHT = 0.32
 # Sticky re-acquire only after this many consecutive frames without a tracked centroid (~3 s @ 30 fps).
 STICKY_SWITCH_AFTER_FRAMES = 90
+# If sticky nearest centroid is farther than this (normalized × frame width), re-run center-weighted pick.
+STICKY_MAX_HORIZONTAL_CENTROID_JUMP = 0.4
 
 
 def _ensure_pose_task_model() -> Path:
@@ -92,25 +94,24 @@ def _pose_bbox_height_norm(pose_lms: List) -> float:
 
 
 def _distant_subject_candidates(pose_landmarks: List[List]) -> List[List]:
-    """Exclude poses taller than half the frame (e.g. kneeling coach). If all excluded, keep smallest."""
+    """Keep only poses with bbox height ≤ threshold (distant player). If none qualify, return []."""
     if not pose_landmarks:
         return []
-    small = [p for p in pose_landmarks if _pose_bbox_height_norm(p) <= POSE_MAX_NORMALIZED_HEIGHT]
-    if small:
-        return small
-    return [min(pose_landmarks, key=_pose_bbox_height_norm)]
+    return [p for p in pose_landmarks if _pose_bbox_height_norm(p) <= POSE_MAX_NORMALIZED_HEIGHT]
 
 
-def _select_by_foot_elevation(pose_landmarks: List[List]) -> List:
-    """Fallback: pick pose with feet highest on screen (farther-away player)."""
+def _select_by_center_and_feet(pose_landmarks: List[List]) -> List:
+    """Initial / re-acquire: prefer pose near horizontal center (player), then feet higher on screen."""
     if len(pose_landmarks) == 1:
         return pose_landmarks[0]
     best_list: Optional[List] = None
-    best_score = float("inf")
+    best_key: Optional[Tuple[float, float]] = None
     for pose_lms in pose_landmarks:
-        score = _mean_foot_y_normalized(pose_lms)
-        if score < best_score:
-            best_score = score
+        cx, _cy = _pose_centroid(pose_lms)
+        foot_y = _mean_foot_y_normalized(pose_lms)
+        key = (abs(cx - 0.5), foot_y)
+        if best_key is None or key < best_key:
+            best_key = key
             best_list = pose_lms
     assert best_list is not None
     return best_list
@@ -140,32 +141,37 @@ def select_sticky_pose(
     prev_centroid: Optional[Tuple[float, float]],
     miss_frames: int,
     switch_after: int = STICKY_SWITCH_AFTER_FRAMES,
-) -> Tuple[List, Tuple[float, float]]:
+) -> Optional[Tuple[List, Tuple[float, float]]]:
     """Sticky-tracking pose selector.
 
     While the player is continuously visible, re-picks whichever pose stays
-    closest to the previous frame's centroid.  Falls back to foot-elevation
-    heuristic only when no prior reference exists or the player was missing
-    for more than `switch_after` consecutive frames.
+    closest to the previous frame's centroid.  When there is no prior anchor or
+    the player was missing for more than ``switch_after`` frames, re-acquires
+    using center-weighted selection (prefer hips near horizontal center), then
+    foot elevation as a tie-breaker — never from poses above the height cap.
 
-    Large foreground figures (normalized bbox height > 50% of frame) are never
-    considered for tracking.
+    Poses taller than ``POSE_MAX_NORMALIZED_HEIGHT`` (normalized bbox; coach is typically above this) are discarded;
+    if no candidate remains, returns None (caller should emit NO_POSE).
 
-    Returns (chosen_landmark_list, centroid_of_chosen).
+    While sticky-matching, if the nearest candidate's horizontal centroid jump exceeds
+    ``STICKY_MAX_HORIZONTAL_CENTROID_JUMP`` (fraction of frame width), falls back to
+    center-weighted selection (different person or timeline scrub).
+
+    Returns (chosen_landmark_list, centroid_of_chosen) or None.
     """
     if not pose_landmarks:
-        raise ValueError("pose_landmarks must be non-empty")
+        return None
     candidates = _distant_subject_candidates(pose_landmarks)
     if not candidates:
-        raise ValueError("pose_landmarks must be non-empty")
+        return None
 
     if len(candidates) == 1:
         chosen = candidates[0]
         return chosen, _pose_centroid(chosen)
 
-    # No previous anchor or player was lost too long → reacquire via heuristic
+    # No previous anchor or player was lost too long → reacquire (never bypass height filter)
     if prev_centroid is None or miss_frames > switch_after:
-        chosen = _select_by_foot_elevation(candidates)
+        chosen = _select_by_center_and_feet(candidates)
         return chosen, _pose_centroid(chosen)
 
     # Sticky: pick the pose whose hip centroid is nearest to the last known position
@@ -179,7 +185,12 @@ def select_sticky_pose(
             best_dist = dist
             best_list = pose_lms
     assert best_list is not None
-    return best_list, _pose_centroid(best_list)
+    pc_chosen = _pose_centroid(best_list)
+    # Horizontal jump vs frame width: new subject or scrubbed video — prefer center-weighted re-acquire
+    if abs(pc_chosen[0] - cx) > STICKY_MAX_HORIZONTAL_CENTROID_JUMP:
+        chosen = _select_by_center_and_feet(candidates)
+        return chosen, _pose_centroid(chosen)
+    return best_list, pc_chosen
 
 
 def keypoints_from_tasks_pose_list(
@@ -211,10 +222,11 @@ class AnalyzerConfig:
     # Ankle must be at least this many pixels below mid-hip (image y grows downward).
     strike_ankle_below_midhip_margin_px: float = 8.0
     # Event-based strike FSM (see process_strike_event_fsm).
-    strike_fsm_min_peak_speed_px_s: float = 90.0
+    # FSM uses speed normalized by subject bbox height (px/s per unit height).
+    strike_fsm_min_peak_norm: float = 300.0
     strike_peak_drop_ratio: float = 0.12  # impact when speed falls this fraction below running peak
     strike_backswing_knee_drop_deg: float = 14.0  # min drop (max→now) over recent window for a leg
-    strike_prep_speed_entry_px_s: float = 42.0  # enter STRIKING when track-leg rel speed exceeds this
+    strike_prep_speed_entry_norm: float = 115.0  # same units as strike_fsm (norm speed)
     strike_prep_max_frames: int = 28  # abort PREPARING → IDLE
     strike_striking_max_frames: int = 40  # abort STRIKING without peak → IDLE
     strike_history_maxlen: int = 20
@@ -267,6 +279,14 @@ def relative_ankle_speed_px_per_sec(
     dx = v1["x"] - v0["x"]
     dy = v1["y"] - v0["y"]
     return float(np.sqrt(dx * dx + dy * dy) / dt_sec)
+
+
+def keypoint_bbox_height_norm(keypoints: Dict[str, Dict[str, float]], frame_h: int) -> float:
+    """Subject vertical span / frame height (0–1), pixel keypoints."""
+    ys = [float(v["y"]) for v in keypoints.values() if isinstance(v, dict) and "y" in v]
+    if not ys or frame_h <= 0:
+        return 1.0
+    return float((max(ys) - min(ys)) / float(frame_h))
 
 
 def ankle_below_mid_hip(
@@ -440,12 +460,14 @@ class FootballAnalyzer:
                 "posture_consistency_score": 0.0,
                 "metrics": {},
                 "voice_feedback": None,
+                "debug_rejected_keypoints": [],
                 "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
                 "timestamp_ms": now_ms,
             }
 
         h, w = frame.shape[:2]
         rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        debug_rejected_keypoints: List[Dict[str, Dict[str, float]]] = []
 
         if self._use_tasks and self._landmarker is not None:
             self._frame_ts += 33
@@ -465,12 +487,34 @@ class FootballAnalyzer:
                     "metrics": {},
                     "voice_feedback": None,
                     "chosen_centroid": None,
+                    "debug_rejected_keypoints": debug_rejected_keypoints,
                     "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
                     "timestamp_ms": now_ms,
                 }
-            chosen, chosen_centroid = select_sticky_pose(
+            for pl in detection_result.pose_landmarks:
+                if _pose_bbox_height_norm(pl) > POSE_MAX_NORMALIZED_HEIGHT:
+                    debug_rejected_keypoints.append(
+                        keypoints_from_tasks_pose_list(pl, w, h, self._lm_names)
+                    )
+            sticky = select_sticky_pose(
                 detection_result.pose_landmarks, prev_centroid, miss_frames
             )
+            if sticky is None:
+                return {
+                    "status": "NO_POSE",
+                    "reason": "subject_filter",
+                    "keypoints": {},
+                    "kick_speed": 0.0,
+                    "knee_angle": 180.0,
+                    "posture_consistency_score": 0.0,
+                    "metrics": {},
+                    "voice_feedback": None,
+                    "chosen_centroid": None,
+                    "debug_rejected_keypoints": debug_rejected_keypoints,
+                    "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
+                    "timestamp_ms": now_ms,
+                }
+            chosen, chosen_centroid = sticky
             raw_keypoints = keypoints_from_tasks_pose_list(chosen, w, h, self._lm_names)
         else:
             assert self.pose is not None
@@ -486,6 +530,7 @@ class FootballAnalyzer:
                     "metrics": {},
                     "voice_feedback": None,
                     "chosen_centroid": None,
+                    "debug_rejected_keypoints": debug_rejected_keypoints,
                     "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
                     "timestamp_ms": now_ms,
                 }
@@ -503,6 +548,26 @@ class FootballAnalyzer:
                 chosen_centroid = (0.5, 0.5)
         fast_motion = detect_fast_motion(prev_keypoints, raw_keypoints, self.config.fast_motion_threshold_px)
         keypoints = smooth_keypoints(prev_keypoints, raw_keypoints, fast_motion)
+
+        pose_height_norm = keypoint_bbox_height_norm(keypoints, h)
+        if pose_height_norm > POSE_MAX_NORMALIZED_HEIGHT:
+            debug_rejected_keypoints.append(dict(keypoints))
+            return {
+                "status": "NO_POSE",
+                "reason": "subject_filter",
+                "keypoints": keypoints,
+                "kick_speed": 0.0,
+                "knee_angle": 180.0,
+                "posture_consistency_score": 0.0,
+                "metrics": {"pose_height_norm": round(float(pose_height_norm), 3)},
+                "voice_feedback": None,
+                "chosen_centroid": None,
+                "smoothed_keypoints": keypoints,
+                "debug_rejected_keypoints": debug_rejected_keypoints,
+                "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
+                "timestamp_ms": now_ms,
+            }
+
         if not self._required_visible(keypoints):
             return {
                 "status": "NO_POSE",
@@ -515,6 +580,7 @@ class FootballAnalyzer:
                 "voice_feedback": None,
                 "chosen_centroid": None,
                 "smoothed_keypoints": keypoints,
+                "debug_rejected_keypoints": debug_rejected_keypoints,
                 "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
                 "timestamp_ms": now_ms,
             }
@@ -573,10 +639,9 @@ class FootballAnalyzer:
         if status == "ALARM":
             velocity_score = min(velocity_score, 55.0)
 
-        print(
-            f"Debug: Speed={kick_speed:.1f} Ext={knee_extension_rate:.1f} "
-            f"Found=True knee_L={left_knee_angle:.0f} knee_R={right_knee_angle:.0f} leg={kicking_leg}"
-        )
+        bbox_h = max(float(pose_height_norm), 1e-4)
+        left_rel_n = float(left_rel / bbox_h)
+        right_rel_n = float(right_rel / bbox_h)
 
         return {
             "status": status,
@@ -590,11 +655,14 @@ class FootballAnalyzer:
                 "hip_tilt_deg": round(float(hip_tilt_deg), 2),
                 "left_ankle_speed_px_s": round(float(left_rel), 2),
                 "right_ankle_speed_px_s": round(float(right_rel), 2),
+                "left_ankle_speed_norm": round(float(left_rel_n), 2),
+                "right_ankle_speed_norm": round(float(right_rel_n), 2),
                 "left_ankle_abs_speed_px_s": round(float(left_abs), 2),
                 "right_ankle_abs_speed_px_s": round(float(right_abs), 2),
                 "knee_extension_rate_deg_s": round(float(knee_extension_rate), 1),
                 "left_knee_angle_deg": round(float(left_knee_angle), 1),
                 "right_knee_angle_deg": round(float(right_knee_angle), 1),
+                "pose_height_norm": round(float(pose_height_norm), 3),
                 "strike_ankle_below_hip": vertical_ok,
                 "fast_motion_mode": fast_motion,
             },
@@ -602,6 +670,7 @@ class FootballAnalyzer:
             "chosen_centroid": chosen_centroid,
             "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
             "smoothed_keypoints": keypoints,
+            "debug_rejected_keypoints": debug_rejected_keypoints,
             "timestamp_ms": now_ms,
         }
 
@@ -674,18 +743,27 @@ def process_strike_event_fsm(session: "SessionState", result: Dict, cfg: Analyze
         session.strike_phase = "IDLE"
         session.strike_track_leg = None
         session.strike_peak_speed = 0.0
+        session.strike_peak_raw = 0.0
         session.strike_saw_backswing = False
         session.strike_phase_frames = 0
         result.setdefault("metrics", {})["strike_phase"] = "IDLE"
         return None
 
     m = result.get("metrics") or {}
+    h_norm_m = float(m.get("pose_height_norm", 0.0) or 1e-4)
+    sp_l_px = float(m.get("left_ankle_speed_px_s", 0.0))
+    sp_r_px = float(m.get("right_ankle_speed_px_s", 0.0))
+    sp_l_n = float(m.get("left_ankle_speed_norm", sp_l_px / max(h_norm_m, 1e-4)))
+    sp_r_n = float(m.get("right_ankle_speed_norm", sp_r_px / max(h_norm_m, 1e-4)))
     sample = {
         "ts": int(result.get("timestamp_ms", 0)),
         "knee_l": float(m.get("left_knee_angle_deg", 180.0)),
         "knee_r": float(m.get("right_knee_angle_deg", 180.0)),
-        "sp_l": float(m.get("left_ankle_speed_px_s", 0.0)),
-        "sp_r": float(m.get("right_ankle_speed_px_s", 0.0)),
+        "sp_l": sp_l_n,
+        "sp_r": sp_r_n,
+        "sp_l_raw": sp_l_px,
+        "sp_r_raw": sp_r_px,
+        "h_norm": float(m.get("pose_height_norm", 0.0)),
         "hip": float(m.get("hip_tilt_deg", 0.0)),
         "vertical_ok": bool(m.get("strike_ankle_below_hip", False)),
         "dom_leg": str(result.get("kicking_leg", "LEFT")),
@@ -703,6 +781,7 @@ def process_strike_event_fsm(session: "SessionState", result: Dict, cfg: Analyze
             session.strike_track_leg = bl
             session.strike_saw_backswing = True
             session.strike_peak_speed = 0.0
+            session.strike_peak_raw = 0.0
             session.strike_phase_frames = 0
 
     elif phase == "PREPARING":
@@ -710,11 +789,13 @@ def process_strike_event_fsm(session: "SessionState", result: Dict, cfg: Analyze
         leg = session.strike_track_leg
         if leg is None:
             session.strike_phase = "IDLE"
+            session.strike_peak_raw = 0.0
         elif session.strike_phase_frames > cfg.strike_prep_max_frames:
             session.strike_phase = "IDLE"
             session.strike_track_leg = None
             session.strike_saw_backswing = False
             session.strike_phase_frames = 0
+            session.strike_peak_raw = 0.0
         else:
             sp_tr = _strike_sp(sample, leg)
             kn = _strike_knee(sample, leg)
@@ -723,12 +804,18 @@ def process_strike_event_fsm(session: "SessionState", result: Dict, cfg: Analyze
             sp_prev = _strike_sp(prev, leg)
             knee_extending = kn > kn_prev + 3.0
             speed_rising = (
-                sp_tr >= cfg.strike_prep_speed_entry_px_s
-                and sp_prev >= cfg.strike_prep_speed_entry_px_s * 0.82
+                sp_tr >= cfg.strike_prep_speed_entry_norm
+                and sp_prev >= cfg.strike_prep_speed_entry_norm * 0.82
             )
             if knee_extending and speed_rising:
                 session.strike_phase = "STRIKING"
                 session.strike_peak_speed = max(sp_tr, sp_prev)
+                session.strike_peak_raw = max(
+                    float(sample["sp_l_raw"]),
+                    float(sample["sp_r_raw"]),
+                    float(prev.get("sp_l_raw", 0.0)),
+                    float(prev.get("sp_r_raw", 0.0)),
+                )
                 session.strike_phase_frames = 0
 
     elif phase == "STRIKING":
@@ -736,34 +823,48 @@ def process_strike_event_fsm(session: "SessionState", result: Dict, cfg: Analyze
         leg = session.strike_track_leg
         if leg is None:
             session.strike_phase = "IDLE"
+            session.strike_peak_raw = 0.0
         elif session.strike_phase_frames > cfg.strike_striking_max_frames:
             session.strike_phase = "IDLE"
             session.strike_track_leg = None
             session.strike_saw_backswing = False
             session.strike_peak_speed = 0.0
+            session.strike_peak_raw = 0.0
             session.strike_phase_frames = 0
         else:
             sp_tr = _strike_sp(sample, leg)
+            raw_dom = max(float(sample["sp_l_raw"]), float(sample["sp_r_raw"]))
+            session.strike_peak_raw = max(session.strike_peak_raw, raw_dom)
             session.strike_peak_speed = max(session.strike_peak_speed, sp_tr)
-            peak = session.strike_peak_speed
-            drop_ok = peak >= cfg.strike_fsm_min_peak_speed_px_s and sp_tr < peak * (1.0 - cfg.strike_peak_drop_ratio)
-            # Require a few frames of forward phase so a single noisy spike cannot "peak" instantly.
-            if session.strike_phase_frames < 4:
-                drop_ok = False
-            if (
-                drop_ok
-                and session.strike_saw_backswing
-                and sample.get("vertical_ok")
-            ):
-                n = min(len(session.strike_history), cfg.strike_post_event_frames)
-                window = list(session.strike_history)[-n:]
-                voice_out = _analyze_strike_sequence(window, leg, cfg)
+            hn = float(sample.get("h_norm", 0.0))
+            if session.strike_peak_raw > 500.0 and hn > 0.4:
                 session.strike_phase = "IDLE"
                 session.strike_track_leg = None
                 session.strike_peak_speed = 0.0
+                session.strike_peak_raw = 0.0
                 session.strike_saw_backswing = False
                 session.strike_phase_frames = 0
                 session.strike_history.clear()
+            else:
+                peak = session.strike_peak_speed
+                drop_ok = peak >= cfg.strike_fsm_min_peak_norm and sp_tr < peak * (1.0 - cfg.strike_peak_drop_ratio)
+                if session.strike_phase_frames < 4:
+                    drop_ok = False
+                if (
+                    drop_ok
+                    and session.strike_saw_backswing
+                    and sample.get("vertical_ok")
+                ):
+                    n = min(len(session.strike_history), cfg.strike_post_event_frames)
+                    window = list(session.strike_history)[-n:]
+                    voice_out = _analyze_strike_sequence(window, leg, cfg)
+                    session.strike_phase = "IDLE"
+                    session.strike_track_leg = None
+                    session.strike_peak_speed = 0.0
+                    session.strike_peak_raw = 0.0
+                    session.strike_saw_backswing = False
+                    session.strike_phase_frames = 0
+                    session.strike_history.clear()
 
     result.setdefault("metrics", {})
     result["metrics"]["strike_phase"] = session.strike_phase
@@ -789,8 +890,37 @@ class SessionState:
     strike_phase: str = "IDLE"
     strike_track_leg: Optional[str] = None
     strike_peak_speed: float = 0.0
+    strike_peak_raw: float = 0.0
     strike_saw_backswing: bool = False
     strike_phase_frames: int = 0
+
+    def wipe_for_new_connection(self) -> None:
+        """Full session reset when a WebSocket is established (no carry-over from prior tabs)."""
+        self.prev_keypoints = {}
+        self.prev_ts_ms = None
+        self.last_frame_time = 0.0
+        self.sticky_centroid = None
+        self.sticky_miss_frames = 0
+        self.no_pose_streak = 0
+        self.strike_history.clear()
+        self.strike_phase = "IDLE"
+        self.strike_track_leg = None
+        self.strike_peak_speed = 0.0
+        self.strike_peak_raw = 0.0
+        self.strike_saw_backswing = False
+        self.strike_phase_frames = 0
+        while True:
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+    def reset_playback_tracking(self) -> None:
+        """Client video play / scrub: clear sticky anchor and strike timeline only."""
+        self.sticky_centroid = None
+        self.sticky_miss_frames = 0
+        self.strike_history.clear()
 
 
 class ConnectionPool:
@@ -986,10 +1116,14 @@ async def process_frame(
         if strike_voice is not None:
             result["voice_feedback"] = strike_voice
 
-        # ---- NO_POSE voice gating ----
+        hn_dbg = float((result.get("metrics") or {}).get("pose_height_norm", 0.0) or 0.0)
+        if result.get("status") == "OK":
+            print(f"Debug: Phase={session.strike_phase} H={hn_dbg:.2f} Speed={session.strike_peak_speed:.1f}")
+
+        # ---- NO_POSE voice: wait ~4s (120 frames @ 30fps) before "Adjust camera" ----
         if result.get("status") == "NO_POSE":
             session.no_pose_streak += 1
-            if result.get("voice_feedback") is None and session.no_pose_streak > 20:
+            if result.get("voice_feedback") is None and session.no_pose_streak > 120:
                 result["voice_feedback"] = VOICE_NO_PLAYER
         else:
             session.no_pose_streak = 0
@@ -1035,6 +1169,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
         if session is None:
             await websocket.close(code=1011, reason="Session initialization failed")
             return
+        session.wipe_for_new_connection()
 
         # Background consumer: reads from session queue and sends results
         async def queue_consumer():
@@ -1054,18 +1189,37 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
         try:
             while True:
-                # Receive with timeout to detect stale connections
+                # Receive with timeout to detect stale connections (binary frames or text commands)
                 try:
-                    raw_msg = await asyncio.wait_for(
-                        websocket.receive_bytes(),
+                    message = await asyncio.wait_for(
+                        websocket.receive(),
                         timeout=SESSION_QUEUE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(f"Receive timeout for {connection_id}")
                     break
                 except Exception as e:
-                    logger.warning(f"Failed to receive binary from {connection_id}: {e}")
+                    logger.warning(f"Failed to receive from {connection_id}: {e}")
                     break
+
+                if message.get("type") == "websocket.disconnect":
+                    break
+
+                if message.get("type") != "websocket.receive":
+                    continue
+
+                if message.get("text"):
+                    try:
+                        cmd = json.loads(message["text"])
+                        if isinstance(cmd, dict) and cmd.get("type") == "reset_session":
+                            session.reset_playback_tracking()
+                    except json.JSONDecodeError:
+                        pass
+                    continue
+
+                raw_msg = message.get("bytes") or b""
+                if not raw_msg:
+                    continue
 
                 # Parse binary protocol: [4-byte header_len][JSON header][JPEG bytes]
                 if len(raw_msg) < 5:
