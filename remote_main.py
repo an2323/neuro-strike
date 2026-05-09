@@ -9,8 +9,10 @@ import os
 import struct
 import time
 import logging
+import urllib.request
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 from contextlib import asynccontextmanager
 
 # Enable AMD ROCm GPU acceleration for MI300X
@@ -39,14 +41,83 @@ SESSION_QUEUE_MAXSIZE = 8
 SESSION_QUEUE_TIMEOUT = 5.0  # seconds
 FRAME_RATE_LIMIT = 0.030     # ~33 FPS max per session
 
+POSE_TASK_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+)
+VOICE_NO_PLAYER = "Adjust camera: player not found"
+
+_MODEL_DIR = Path(__file__).resolve().parent / "models"
+_POSE_TASK_MODEL_PATH = _MODEL_DIR / "pose_landmarker_lite.task"
+
+# Ankles + foot indices (same as BlazePose / legacy Pose)
+_FOOT_LANDMARK_IDX: Tuple[int, ...] = (27, 28, 31, 32)
+
+
+def _ensure_pose_task_model() -> Path:
+    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    if not _POSE_TASK_MODEL_PATH.is_file():
+        logger.info("Downloading Pose Landmarker task model to %s", _POSE_TASK_MODEL_PATH)
+        urllib.request.urlretrieve(POSE_TASK_MODEL_URL, _POSE_TASK_MODEL_PATH)
+    return _POSE_TASK_MODEL_PATH
+
+
+def _pose_landmark_names() -> Tuple[str, ...]:
+    return tuple(
+        e.name for e in sorted(mp.solutions.pose.PoseLandmark, key=lambda x: x.value)
+    )
+
+
+def _mean_foot_y_normalized(pose_lms: List) -> float:
+    """Mean normalized foot Y; lower => feet higher in frame (often farther subject)."""
+    ys: List[float] = []
+    for i in _FOOT_LANDMARK_IDX:
+        if i < len(pose_lms):
+            ys.append(float(pose_lms[i].y))
+    return float(sum(ys) / len(ys)) if ys else 1.0
+
+
+def select_pose_by_foot_elevation(pose_landmarks: List[List]) -> List:
+    """Pick one pose from multi-person output: smallest mean foot Y (feet highest on screen)."""
+    if not pose_landmarks:
+        raise ValueError("pose_landmarks must be non-empty")
+    if len(pose_landmarks) == 1:
+        return pose_landmarks[0]
+    best_list: Optional[List] = None
+    best_score = float("inf")
+    for pose_lms in pose_landmarks:
+        score = _mean_foot_y_normalized(pose_lms)
+        if score < best_score:
+            best_score = score
+            best_list = pose_lms
+    assert best_list is not None
+    return best_list
+
+
+def keypoints_from_tasks_pose_list(
+    pose_lms: List, width: int, height: int, names: Tuple[str, ...]
+) -> Dict[str, Dict[str, float]]:
+    points: Dict[str, Dict[str, float]] = {}
+    for i, lm in enumerate(pose_lms):
+        if i >= len(names):
+            break
+        vis = float(getattr(lm, "visibility", 1.0) or 1.0)
+        points[names[i]] = {
+            "x": float(lm.x * width),
+            "y": float(lm.y * height),
+            "z": float(lm.z),
+            "visibility": vis,
+        }
+    return points
+
 
 @dataclass
 class AnalyzerConfig:
-    min_visibility: float = 0.4
+    min_visibility: float = 0.3
     hip_tilt_threshold_deg: float = 14.0
     knee_min_deg: float = 120.0
     knee_max_deg: float = 176.0
-    alarm_speed_threshold_px_s: float = 280.0
+    alarm_speed_threshold_px_s: float = 50.0
     fast_motion_threshold_px: float = 12.0
 
 
@@ -108,22 +179,51 @@ def smooth_keypoints(
 
 
 class FootballAnalyzer:
-    """MediaPipe Pose wrapper using the legacy solutions API (compatible with mediapipe 0.10.x)."""
+    """Pose via MediaPipe Tasks (multi-person) when available; legacy Pose otherwise."""
 
     def __init__(self, config: Optional[AnalyzerConfig] = None) -> None:
         self.config = config or AnalyzerConfig()
         self.mp_pose = mp.solutions.pose
+        self._lm_names = _pose_landmark_names()
+        self._use_tasks = False
+        self._landmarker = None
+        self.pose = None
+        self._frame_ts = 0
+        self._TaskImage = None
+        self._TaskImageFormat = None
 
-        # AMD MI300X optimized settings
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=2,  # Maximum precision for professional analysis
-            smooth_landmarks=True,
-            enable_segmentation=False,  # Disable to save GPU memory
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        logger.info("FootballAnalyzer initialized with model_complexity=2")
+        try:
+            from mediapipe.tasks.python import vision as tasks_vision
+            from mediapipe.tasks.python.core import base_options as task_base
+            from mediapipe.tasks.python.vision.core import vision_task_running_mode as vtrm
+
+            model_path = str(_ensure_pose_task_model())
+            opts = tasks_vision.PoseLandmarkerOptions(
+                base_options=task_base.BaseOptions(model_asset_path=model_path),
+                running_mode=vtrm.VisionTaskRunningMode.VIDEO,
+                num_poses=4,
+                min_pose_detection_confidence=0.4,
+                min_pose_presence_confidence=0.4,
+                min_tracking_confidence=0.4,
+            )
+            from mediapipe.tasks.python.vision.core import image as task_image_mod
+
+            self._TaskImage = task_image_mod.Image
+            self._TaskImageFormat = task_image_mod.ImageFormat
+            self._landmarker = tasks_vision.PoseLandmarker.create_from_options(opts)
+            self._use_tasks = True
+            logger.info("FootballAnalyzer: PoseLandmarker VIDEO (num_poses=4, conf=0.4)")
+        except Exception as e:
+            logger.warning("PoseLandmarker unavailable (%s); using legacy Pose", e)
+            self.pose = self.mp_pose.Pose(
+                static_image_mode=False,
+                model_complexity=2,
+                smooth_landmarks=True,
+                enable_segmentation=False,
+                min_detection_confidence=0.4,
+                min_tracking_confidence=0.4,
+            )
+            logger.info("FootballAnalyzer: legacy Pose (model_complexity=2, conf=0.4)")
 
     @staticmethod
     def _decode_frame(jpeg_bytes: bytes) -> Optional[np.ndarray]:
@@ -188,27 +288,53 @@ class FootballAnalyzer:
                 "knee_angle": 180.0,
                 "posture_consistency_score": 0.0,
                 "metrics": {},
+                "voice_feedback": None,
                 "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
                 "timestamp_ms": now_ms,
             }
 
         h, w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = self.pose.process(rgb)
-        if not result.pose_landmarks:
-            return {
-                "status": "NO_POSE",
-                "reason": "no_pose",
-                "keypoints": {},
-                "kick_speed": 0.0,
-                "knee_angle": 180.0,
-                "posture_consistency_score": 0.0,
-                "metrics": {},
-                "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
-                "timestamp_ms": now_ms,
-            }
+        rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        raw_keypoints = self._extract_all_keypoints(result.pose_landmarks, w, h)
+        if self._use_tasks and self._landmarker is not None:
+            self._frame_ts += 33
+            mp_image = self._TaskImage(
+                image_format=self._TaskImageFormat.SRGB,
+                data=rgb,
+            )
+            detection_result = self._landmarker.detect_for_video(mp_image, self._frame_ts)
+            if not detection_result.pose_landmarks:
+                return {
+                    "status": "NO_POSE",
+                    "reason": "no_pose",
+                    "keypoints": {},
+                    "kick_speed": 0.0,
+                    "knee_angle": 180.0,
+                    "posture_consistency_score": 0.0,
+                    "metrics": {},
+                    "voice_feedback": VOICE_NO_PLAYER,
+                    "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
+                    "timestamp_ms": now_ms,
+                }
+            chosen = select_pose_by_foot_elevation(detection_result.pose_landmarks)
+            raw_keypoints = keypoints_from_tasks_pose_list(chosen, w, h, self._lm_names)
+        else:
+            assert self.pose is not None
+            result = self.pose.process(rgb)
+            if not result.pose_landmarks:
+                return {
+                    "status": "NO_POSE",
+                    "reason": "no_pose",
+                    "keypoints": {},
+                    "kick_speed": 0.0,
+                    "knee_angle": 180.0,
+                    "posture_consistency_score": 0.0,
+                    "metrics": {},
+                    "voice_feedback": VOICE_NO_PLAYER,
+                    "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
+                    "timestamp_ms": now_ms,
+                }
+            raw_keypoints = self._extract_all_keypoints(result.pose_landmarks, w, h)
         fast_motion = detect_fast_motion(prev_keypoints, raw_keypoints, self.config.fast_motion_threshold_px)
         keypoints = smooth_keypoints(prev_keypoints, raw_keypoints, fast_motion)
         if not self._required_visible(keypoints):
@@ -220,6 +346,7 @@ class FootballAnalyzer:
                 "knee_angle": 180.0,
                 "posture_consistency_score": 0.0,
                 "metrics": {},
+                "voice_feedback": None,
                 "smoothed_keypoints": keypoints,
                 "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
                 "timestamp_ms": now_ms,
@@ -255,6 +382,16 @@ class FootballAnalyzer:
         if status == "ALARM":
             velocity_score = min(velocity_score, 55.0)
 
+        kick_detected = kick_speed > self.config.alarm_speed_threshold_px_s
+        voice_feedback: Optional[str] = None
+        if kick_detected:
+            if hip_tilt_deg > self.config.hip_tilt_threshold_deg:
+                voice_feedback = "Lean forward"
+            elif knee_angle > self.config.knee_max_deg:
+                voice_feedback = "Bend your knee"
+            else:
+                voice_feedback = "Great strike"
+
         return {
             "status": status,
             "reason": "strike_risk" if is_alarm else "strike_ok",
@@ -269,15 +406,19 @@ class FootballAnalyzer:
                 "right_ankle_speed_px_s": round(float(right_speed), 2),
                 "fast_motion_mode": fast_motion,
             },
+            "voice_feedback": voice_feedback,
             "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
             "smoothed_keypoints": keypoints,
             "timestamp_ms": now_ms,
         }
 
-    def close(self):
-        """Cleanup MediaPipe resources."""
-        if hasattr(self, 'pose'):
+    def close(self) -> None:
+        if getattr(self, "_landmarker", None) is not None:
+            self._landmarker.close()
+            self._landmarker = None
+        if getattr(self, "pose", None) is not None:
             self.pose.close()
+            self.pose = None
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +578,7 @@ async def process_frame(
             "knee_angle": 180.0,
             "posture_consistency_score": 0.0,
             "metrics": {},
+            "voice_feedback": None,
             "inference_time_ms": 0.0,
             "client_ts": client_ts,
             "frame_seq": frame_seq_in,
@@ -453,6 +595,7 @@ async def process_frame(
             "knee_angle": 180.0,
             "posture_consistency_score": 0.0,
             "metrics": {},
+            "voice_feedback": None,
             "inference_time_ms": 0.0,
             "client_ts": client_ts,
             "frame_seq": frame_seq_in,
@@ -480,6 +623,7 @@ async def process_frame(
             "knee_angle": 180.0,
             "posture_consistency_score": 0.0,
             "metrics": {},
+            "voice_feedback": None,
             "inference_time_ms": 0.0,
             "client_ts": client_ts,
             "frame_seq": frame_seq_in,

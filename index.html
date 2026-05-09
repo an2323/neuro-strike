@@ -388,6 +388,34 @@
       let bytesPerFrame = 0;
       const MAX_LATENCY_SAMPLES = 100;
 
+      class SpeechManager {
+        constructor() {
+          this.supported =
+            typeof window !== "undefined" && "speechSynthesis" in window;
+          this._lastSpoken = null;
+        }
+
+        speak(text) {
+          if (!this.supported || text == null) {
+            return;
+          }
+          const s = String(text).trim();
+          if (!s) {
+            return;
+          }
+          if (s === this._lastSpoken) {
+            return;
+          }
+          this._lastSpoken = s;
+          window.speechSynthesis.cancel();
+          const u = new SpeechSynthesisUtterance(s);
+          u.lang = "en-US";
+          window.speechSynthesis.speak(u);
+        }
+      }
+
+      const speechManager = new SpeechManager();
+
       const indexToName = {
         11: "LEFT_SHOULDER",
         12: "RIGHT_SHOULDER",
@@ -752,6 +780,11 @@
         };
         ws.onmessage = (event) => {
           const data = JSON.parse(event.data);
+          console.log("Feedback received:", data.voice_feedback);
+          const vf = data.voice_feedback;
+          if (vf != null && String(vf).trim() !== "") {
+            speechManager.speak(vf);
+          }
           const rtt = data.client_ts ? Date.now() - data.client_ts : 0;
           recordLatency(rtt);
           const score = Number(data.posture_consistency_score ?? 0);

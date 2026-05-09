@@ -1,0 +1,34 @@
+High-performance sports analytics system (NeuroStrike) for football strike analysis.
+
+Hardware: AMD MI300X GPU via ROCm.
+
+Backend: FastAPI, MediaPipe Pose (Complexity 2), OpenCV, NumPy.
+
+Frontend: Vanilla JS, HTML5 Canvas, WebSockets, Chart.js.
+
+Core Rules for AI:
+
+AMD ROCm Priority: Always maintain MEDIAPIPE_DISABLE_GPU=0 for the remote server. Never suggest CUDA-specific optimizations.
+
+Binary Protocol Integrity: The communication uses a custom binary protocol: [4-byte Header (JSON length)][JSON Metadata][JPEG Frame]. Do NOT change this structure without explicit instruction, as it is optimized for MI300X throughput.
+
+Model Complexity: Always use model_complexity=2 for the backend Pose estimation to ensure professional-grade biomechanical accuracy.
+
+Coordinate Scaling: Remember that frames are processed at 640x360 on the server but rendered on dynamic canvas sizes. Always apply sx and sy scaling factors for skeleton overlays.
+
+Hybrid Logic:
+
+Local (JS): Responsible for zero-latency UI and rhythm-based audio cues.
+
+Remote (MI300X): Responsible for heavy biomechanics (angles, speed, AI coaching logic).
+
+Biomechanical Definitions:
+
+kick_speed: Peak velocity of the ankle landmark.
+
+knee_angle: Angle between Hip-Knee-Ankle.
+
+hip_tilt: Rotation/tilt of the Pelvis landmarks.
+
+Tone & Style:
+Be a world-class SportsTech engineer. Provide concise, production-ready code. Use English for code/comments but feel free to explain logic in Ukrainian if requested.
