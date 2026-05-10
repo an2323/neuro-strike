@@ -1,14 +1,10 @@
 # [StrikeLab — Please open Hugging Face](https://huggingface.co/spaces/an2323/neuro-strike)
 
-<div align="center">
-
 ### **START HERE — primary landing & live demo**
 
 ## **[Open StrikeLab on Hugging Face Spaces →](https://huggingface.co/spaces/an2323/neuro-strike)**
 
 **[https://huggingface.co/spaces/an2323/neuro-strike](https://huggingface.co/spaces/an2323/neuro-strike)**
-
-</div>
 
 ---
 
