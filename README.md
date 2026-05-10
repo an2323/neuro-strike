@@ -1,10 +1,10 @@
-# [StrikeLab — AMD ROCm Football Biomechanics (open HF)](https://huggingface.co/spaces/an2323/neuro-strike)
+# [StrikeLab — Please open Hugging Face](https://huggingface.co/spaces/an2323/neuro-strike)
 
 <div align="center">
 
 ### **START HERE — primary landing & live demo**
 
-## [**Open StrikeLab on Hugging Face Spaces →**](https://huggingface.co/spaces/an2323/neuro-strike)
+## **[Open StrikeLab on Hugging Face Spaces →](https://huggingface.co/spaces/an2323/neuro-strike)**
 
 **[https://huggingface.co/spaces/an2323/neuro-strike](https://huggingface.co/spaces/an2323/neuro-strike)**
 
@@ -20,10 +20,12 @@ The AMD infrastructure advantage is GPU-accelerated pose inference without CUDA.
 
 ## ROCm Performance Summary
 
-| Version | Backend | End-to-end time | Notes |
-|---------|---------|-----------------|-------|
-| Original CPU path | CPU MediaPipe | ~80s | User-observed before ROCm work |
-| Current accuracy mode | MediaPipe tracker + optimized renderer | 16.09s | More stable skeleton / heatmap for multi-player footage |
+
+| Version               | Backend                                | End-to-end time | Notes                                                   |
+| --------------------- | -------------------------------------- | --------------- | ------------------------------------------------------- |
+| Original CPU path     | CPU MediaPipe                          | ~80s            | User-observed before ROCm work                          |
+| Current accuracy mode | MediaPipe tracker + optimized renderer | 16.09s          | More stable skeleton / heatmap for multi-player footage |
+
 
 Measured speedups:
 
@@ -31,13 +33,15 @@ Measured speedups:
 
 Latest stable run breakdown:
 
-| Phase | Time |
-|-------|------|
-| Upload / file handling | ~1.0s |
+
+| Phase                                       | Time  |
+| ------------------------------------------- | ----- |
+| Upload / file handling                      | ~1.0s |
 | Pose tracking + biomechanical preprocessing | ~7.7s |
-| Storyboard / overlay preparation | ~0.6s |
-| MoviePy cinematic render / export | ~6.5s |
-| FFmpeg browser remux | ~0.1s |
+| Storyboard / overlay preparation            | ~0.6s |
+| MoviePy cinematic render / export           | ~6.5s |
+| FFmpeg browser remux                        | ~0.1s |
+
 
 Optimization steps applied:
 
@@ -99,12 +103,14 @@ flowchart TD
 
 The repo contains **three runnable surfaces** that share the same biomechanical ideas but target different workflows:
 
-| Component | Role |
-|-----------|------|
-| **Strike Lab** (`app.py`) | Web UI + **Flask** API: upload `.mp4` / `.mov`, run offline processing, download narrated MP4, storyboard PNG, and structured coaching JSON. |
-| **`strike_video_processor.py`** | CLI / library: full pipeline (MediaPipe → smoothing → narrated video + storyboard). Used by Strike Lab. |
-| **`remote_main.py`** | **FastAPI** + **WebSockets**: high-concurrency remote analyzer for MI300X; binary + JPEG streaming (see code for protocol). |
-| **`main.py`** | Smaller **FastAPI** app (e.g. local/dev) with upload/WebSocket paths; may default MediaPipe to CPU — check env in file. |
+
+| Component                       | Role                                                                                                                                         |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Strike Lab** (`app.py`)            | Web UI + **Flask** API: upload `.mp4` / `.mov`, run offline processing, download narrated MP4, storyboard PNG, and structured coaching JSON. |
+| **`strike_video_processor.py`**    | CLI / library: full pipeline (MediaPipe → smoothing → narrated video + storyboard). Used by Strike Lab.                                         |
+| **`remote_main.py`**               | **FastAPI** + **WebSockets**: high-concurrency remote analyzer for MI300X; binary + JPEG streaming (see code for protocol).                     |
+| **`main.py`**                      | Smaller **FastAPI** app (e.g. local/dev) with upload/WebSocket paths; may default MediaPipe to CPU — check env in file.                        |
+
 
 ---
 
@@ -163,7 +169,7 @@ bash scripts/fix_venv_opencv_numpy.sh   # strongly recommended once (OpenCV / Nu
 python app.py
 ```
 
-Then open **http://127.0.0.1:5050/** (or host/port from env: `STRIKE_LAB_HOST`, `STRIKE_LAB_PORT`).
+Then open **[http://127.0.0.1:5050/](http://127.0.0.1:5050/)** (or host/port from env: `STRIKE_LAB_HOST`, `STRIKE_LAB_PORT`).
 
 - **`STRIKE_LAB_DEV=1 python app.py`** — Flask development server instead of Waitress.
 
