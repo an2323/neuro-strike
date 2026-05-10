@@ -53,9 +53,21 @@ The repo contains **three runnable surfaces** that share the same biomechanical 
 3. **Smooth** trajectories (Savitzky–Golay where SciPy is available).
 4. **Detect** strike phase, kicking leg, and biomechanical signals (e.g. ankle speed, joint angles, form match vs a corrected “ghost” template).
 5. **Produce**:
-   - A single **narrated analysis MP4** (overlay + freeze segments + **gTTS** commentary, assembled with **MoviePy**).
-   - A **three-panel storyboard** PNG.
-   - **Coaching payload** (scores, strengths/weaknesses, drill suggestions) returned as JSON to the browser.
+   - A **video analysis MP4** with pauses, zooms, overlays, and **gTTS** narration.
+   - A **three-phase kick analysis** storyboard.
+   - **Coaching recommendations** with strengths, weaknesses, and exercise suggestions.
+
+### Video Analysis With Pauses, Zoom, And TTS
+
+![Video analysis with pauses, zoom, and TTS recommendations](docs/images/video-feedback-with-tts.png)
+
+### Three-Phase Kick Analysis
+
+![Three-phase kick analysis](docs/images/3-steps-analyze.png)
+
+### Coaching Recommendations With Exercises
+
+![Coaching recommendations with exercises](docs/images/recommendations.png)
 
 Processing expects **Linux + Python 3.10+** and a sane **ffmpeg/ffprobe** on `PATH` for H.264 remux and audio handling.
 
