@@ -4,6 +4,8 @@
 
 The project is optimized for **AMD ROCm on MI300X**. The accelerated path uses **ONNX Runtime**, **MIGraphXExecutionProvider**, ROCm / hipBLAS compatibility shims where needed, OpenCV, MoviePy, ffmpeg, and a MediaPipe-based accuracy mode for more stable multi-player footage.
 
+The AMD infrastructure advantage is GPU-accelerated pose inference without CUDA. MI300X runs BlazePose-compatible ONNX models through ROCm and MIGraphX, while StrikeLab keeps a MediaPipe tracker path for reliability on crowded football footage. This moved the system from CPU-bound video analysis to a mixed GPU + optimized-render pipeline.
+
 ## ROCm Performance Summary
 
 | Version | Backend | End-to-end time | Notes |
@@ -27,7 +29,7 @@ Latest stable run breakdown:
 
 Optimization steps applied:
 
-1. Moved neural inference from CPU MediaPipe to **ROCm + ONNX Runtime + MIGraphX** on MI300X.
+1. Added a **ROCm + ONNX Runtime + MIGraphX** inference path on MI300X.
 2. Preserved 33-landmark biomechanics by using BlazePose-compatible ONNX models instead of lower-keypoint pose models.
 3. Added GPU fallback safety so the app can fall back to CPU / tracker paths when ROCm is unavailable.
 4. Hardened NaN handling in cinematic overlays for frames with missing pose detections.
