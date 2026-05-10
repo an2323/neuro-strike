@@ -3,8 +3,8 @@
 NeuroStrike — offline football strike video post-processor.
 
 Input: path to a video file (any format OpenCV can decode).
-Output: annotated MP4 with MediaPipe pose, Savitzky–Golay smoothing, a 30-frame
-“perfect strike” ghost overlay, error vectors, power meter, and form-match %.
+Output: annotated MP4 with MediaPipe pose, Savitzky–Golay smoothing, a Dynamic
+Adaptive Coach ghost (biomechanically corrected per frame), error vectors, power meter, form-match %.
 
 Usage:
   python strike_video_processor.py --input kick.mp4 --output kick_ghost.mp4
@@ -112,97 +112,6 @@ FORM_MATCH_LM_INDICES = (
 )
 
 
-def build_perfect_strike_ghost() -> np.ndarray:
-    """
-    Hardcoded 30-frame perfect strike in normalized image coordinates (x,y in [0,1]).
-    Right-leg instep-style motion; camera-facing frontal template.
-    Shape: (30, 33, 2).
-    """
-    mp_pose = mp.solutions.pose
-
-    def base_standing() -> np.ndarray:
-        p = np.zeros((33, 2), dtype=np.float64)
-        # Rough BlazePose-normalized layout (frontal, feet apart).
-        p[0] = (0.50, 0.14)  # NOSE
-        p[2] = (0.50, 0.16)  # RIGHT_EYE
-        p[5] = (0.50, 0.16)  # LEFT_EYE
-        p[7] = (0.48, 0.18)  # LEFT_EAR
-        p[8] = (0.52, 0.18)  # RIGHT_EAR
-        p[11] = (0.40, 0.26)  # LEFT_SHOULDER
-        p[12] = (0.60, 0.26)  # RIGHT_SHOULDER
-        p[13] = (0.38, 0.38)  # LEFT_ELBOW
-        p[14] = (0.62, 0.38)  # RIGHT_ELBOW
-        p[15] = (0.36, 0.50)  # LEFT_WRIST
-        p[16] = (0.64, 0.50)  # RIGHT_WRIST
-        p[23] = (0.44, 0.52)  # LEFT_HIP
-        p[24] = (0.56, 0.52)  # RIGHT_HIP
-        p[25] = (0.44, 0.72)  # LEFT_KNEE
-        p[26] = (0.56, 0.68)  # RIGHT_KNEE — start slightly flexed
-        p[27] = (0.44, 0.90)  # LEFT_ANKLE
-        p[28] = (0.56, 0.88)  # RIGHT_ANKLE
-        p[29] = (0.44, 0.94)  # LEFT_HEEL
-        p[30] = (0.56, 0.92)  # RIGHT_HEEL
-        p[31] = (0.42, 0.94)  # LEFT_FOOT_INDEX
-        p[32] = (0.58, 0.90)  # RIGHT_FOOT_INDEX
-        # Mid spine / hips helpers
-        p[9] = (0.49, 0.22)  # MOUTH_LEFT
-        p[10] = (0.51, 0.22)  # MOUTH_RIGHT
-        return p
-
-    key_t = np.array([0.0, 0.25, 0.5, 0.72, 1.0], dtype=np.float64)
-    keyframes: List[np.ndarray] = []
-
-    k0 = base_standing()
-    keyframes.append(k0.copy())
-
-    k1 = k0.copy()
-    # Wind-up: lift right knee, shift trunk slightly
-    k1[24] = (0.57, 0.50)
-    k1[26] = (0.58, 0.58)
-    k1[28] = (0.62, 0.70)
-    k1[30] = (0.62, 0.74)
-    k1[32] = (0.64, 0.72)
-    k1[12] = (0.61, 0.25)
-    k1[16] = (0.66, 0.46)
-    keyframes.append(k1)
-
-    k2 = k1.copy()
-    # Strike extension: leg forward-up, torso lean
-    k2[0] = (0.52, 0.15)
-    k2[11] = (0.39, 0.27)
-    k2[12] = (0.62, 0.24)
-    k2[23] = (0.43, 0.54)
-    k2[24] = (0.58, 0.52)
-    k2[26] = (0.55, 0.48)
-    k2[28] = (0.48, 0.42)
-    k2[30] = (0.47, 0.44)
-    k2[32] = (0.46, 0.40)
-    k2[25] = (0.44, 0.74)
-    k2[27] = (0.44, 0.90)
-    keyframes.append(k2)
-
-    k3 = k2.copy()
-    # Follow-through low
-    k3[26] = (0.52, 0.62)
-    k3[28] = (0.50, 0.78)
-    k3[32] = (0.48, 0.82)
-    k3[12] = (0.60, 0.26)
-    keyframes.append(k3)
-
-    k4 = base_standing()
-    k4[26] = (0.56, 0.70)
-    k4[28] = (0.56, 0.88)
-    k4[32] = (0.58, 0.90)
-    keyframes.append(k4)
-
-    stacked = np.stack(keyframes, axis=0)  # (5, 33, 2)
-    t_dst = np.linspace(0.0, 4.0, GHOST_FRAMES, dtype=np.float64)
-    out = np.zeros((GHOST_FRAMES, 33, 2), dtype=np.float64)
-    for lm in range(33):
-        for d in range(2):
-            out[:, lm, d] = np.interp(t_dst, key_t, stacked[:, lm, d])
-    return np.clip(out, 0.02, 0.98)
-
 
 def _savgol_1d(x: np.ndarray) -> np.ndarray:
     """Savitzky–Golay along time for a single coordinate series."""
@@ -265,9 +174,33 @@ def _ankle_speeds(
 
 
 def _find_peak_frame(speeds: np.ndarray) -> int:
-    i = int(np.argmax(speeds))
-    if speeds[i] < 1e-6:
-        return len(speeds) // 2
+    """
+    Find the impact-like peak robustly.
+
+    We intentionally ignore very early/late video regions where setup movement
+    and stop-motion noise often produce false maxima.
+    """
+    n = int(speeds.shape[0])
+    if n <= 2:
+        return max(0, n // 2)
+
+    # Light temporal smoothing to suppress one-frame spikes.
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float64)
+    kernel /= float(np.sum(kernel))
+    s = np.convolve(speeds.astype(np.float64), kernel, mode="same")
+
+    # Action usually happens away from intro/outro; constrain search window.
+    lo = int(max(0, n * 0.15))
+    hi = int(min(n, max(lo + 1, n * 0.95)))
+    window = s[lo:hi]
+    if window.size == 0:
+        window = s
+        lo = 0
+
+    i = lo + int(np.argmax(window))
+    peak = float(s[i])
+    if peak < 1e-6:
+        return n // 2
     return i
 
 
@@ -289,16 +222,28 @@ def _strike_phase_window(speeds: np.ndarray, peak_idx: int) -> Tuple[int, int]:
     while end < n - 1 and float(speeds[end + 1]) >= thr:
         end += 1
     # Provide context around detected motion.
-    start = max(0, start - 8)
-    end = min(n - 1, end + 10)
+    start = max(0, start - 10)
+    end = min(n - 1, end + 14)
+
+    # Prevent extremely short windows from noisy thresholds.
+    min_span = min(max(18, GHOST_FRAMES // 2), n - 1) if n > 1 else 0
+    curr_span = end - start
+    if curr_span < min_span:
+        pad = (min_span - curr_span + 1) // 2
+        start = max(0, start - pad)
+        end = min(n - 1, end + pad)
     return (start, end)
 
 
-def _ghost_index_for_frame(frame_idx: int, phase_start: int, phase_end: int) -> Optional[int]:
-    """Loop ghost frames through the whole detected strike phase."""
-    if frame_idx < phase_start or frame_idx > phase_end:
-        return None
-    return int((frame_idx - phase_start) % GHOST_FRAMES)
+def _in_strike_phase(frame_idx: int, phase_start: int, phase_end: int) -> bool:
+    """Return True if frame_idx is within the detected strike phase."""
+    return phase_start <= frame_idx <= phase_end
+
+
+def _phase_t(frame_idx: int, phase_start: int, phase_end: int) -> float:
+    """Normalised position within the strike phase: 0.0 wind-up, 0.5 impact, 1.0 follow-through."""
+    span = max(1, phase_end - phase_start)
+    return float(np.clip((frame_idx - phase_start) / span, 0.0, 1.0))
 
 
 def _midpoint_xy(points_xy: np.ndarray, idxs: Tuple[int, int], vis: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
@@ -317,25 +262,6 @@ def _midpoint_xy(points_xy: np.ndarray, idxs: Tuple[int, int], vis: Optional[np.
     return np.mean(np.stack(vals, axis=0), axis=0)
 
 
-def _transform_ghost_to_user(ghost_xy_norm: np.ndarray, user_xy_norm: np.ndarray, user_vis: np.ndarray) -> np.ndarray:
-    """
-    Scale ghost by user torso (shoulder↔hip) and center on user's hip midpoint.
-    Works in normalized coords.
-    """
-    g_hip = _midpoint_xy(ghost_xy_norm, _HIP_IDXS, None)
-    g_sh = _midpoint_xy(ghost_xy_norm, _SHOULDER_IDXS, None)
-    u_hip = _midpoint_xy(user_xy_norm, _HIP_IDXS, user_vis)
-    u_sh = _midpoint_xy(user_xy_norm, _SHOULDER_IDXS, user_vis)
-    if g_hip is None or u_hip is None:
-        return ghost_xy_norm.copy()
-    scale = 1.0
-    if g_sh is not None and u_sh is not None:
-        g_torso = float(np.linalg.norm(g_sh - g_hip))
-        u_torso = float(np.linalg.norm(u_sh - u_hip))
-        if g_torso > 1e-4 and np.isfinite(u_torso):
-            scale = float(np.clip(u_torso / g_torso, 0.35, 2.8))
-    return (ghost_xy_norm - g_hip) * scale + u_hip
-
 
 def _is_cornerish_norm(pt_norm: np.ndarray, eps: float = 0.03) -> bool:
     """Skip vectors around (0,0) / (1,1) to avoid corner-shooting artifacts."""
@@ -343,6 +269,145 @@ def _is_cornerish_norm(pt_norm: np.ndarray, eps: float = 0.03) -> bool:
         return True
     x, y = float(pt_norm[0]), float(pt_norm[1])
     return (x <= eps and y <= eps) or (x >= 1.0 - eps and y >= 1.0 - eps)
+
+
+# ─── BlazePose leg landmark indices ─────────────────────────────────────────
+_LEFT_LEG  = {"hip": 23, "knee": 25, "ankle": 27, "heel": 29, "foot": 31}
+_RIGHT_LEG = {"hip": 24, "knee": 26, "ankle": 28, "heel": 30, "foot": 32}
+
+# ─── Biomechanical correction targets ────────────────────────────────────────
+_LEAN_TARGET_DEG  = 7.5   # ideal forward torso lean from vertical (degrees)
+_WINDUP_EXTRA_DEG = 20.0  # extra knee bend added during wind-up phase
+_IMPACT_EXT_DEG   = 168.0 # target knee angle at impact (near-straight)
+
+
+def _joint_angle_deg(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    """Angle in degrees at vertex b, formed by the a-b-c chain."""
+    ba, bc = a - b, c - b
+    la, lc = np.linalg.norm(ba), np.linalg.norm(bc)
+    if la < 1e-6 or lc < 1e-6:
+        return 180.0
+    return float(np.degrees(np.arccos(np.clip(np.dot(ba, bc) / (la * lc), -1.0, 1.0))))
+
+
+def _set_joint_angle(
+    proximal: np.ndarray,
+    middle: np.ndarray,
+    distal: np.ndarray,
+    target_deg: float,
+) -> np.ndarray:
+    """
+    Return a new distal position so the angle at middle equals target_deg.
+    The distal segment length is preserved; the rotation direction maintains
+    the current anatomical orientation (same side as original distal).
+    """
+    v1 = proximal - middle   # bone toward proximal joint
+    v2 = distal - middle     # bone toward distal joint
+    l1, l2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if l1 < 1e-6 or l2 < 1e-6:
+        return distal.copy()
+    v1u = v1 / l1
+    target_rad = np.radians(np.clip(target_deg, 1.0, 179.0))
+    # Choose a perpendicular to v1u that lies on the same side as v2
+    perp = np.array([-v1u[1], v1u[0]])   # 90° CCW from v1u
+    if np.dot(v2, perp) < 0:
+        perp = -perp                       # flip to match the anatomical side
+    # Construct the new distal direction at exactly target_rad from v1u
+    new_v2_unit = np.cos(target_rad) * v1u + np.sin(target_rad) * perp
+    return middle + l2 * new_v2_unit
+
+
+def _detect_kicking_leg(smooth: np.ndarray, vis: np.ndarray, peak_idx: int) -> str:
+    """Identify the kicking leg by comparing ankle displacement near the peak frame."""
+    lo = max(0, peak_idx - 4)
+    hi = min(smooth.shape[0], peak_idx + 5)
+    sl = sr = 0.0
+    for i in range(lo + 1, hi):
+        if vis[i, 27] > 0.2 and vis[i - 1, 27] > 0.2:
+            sl += float(np.linalg.norm(smooth[i, 27] - smooth[i - 1, 27]))
+        if vis[i, 28] > 0.2 and vis[i - 1, 28] > 0.2:
+            sr += float(np.linalg.norm(smooth[i, 28] - smooth[i - 1, 28]))
+    kicking = "LEFT" if sl >= sr else "RIGHT"
+    logger.info("Kicking leg detected: %s (left_disp=%.4f  right_disp=%.4f)", kicking, sl, sr)
+    return kicking
+
+
+def _generate_corrected_ghost(
+    user_xy: np.ndarray,
+    user_vis: np.ndarray,
+    phase_t: float,
+    kicking_side: str,
+) -> np.ndarray:
+    """
+    Build a per-frame 'ideal form' skeleton from the user's own coordinates.
+
+    All corrections operate in the same normalised image space as user_xy, so
+    the ghost is automatically matched in position and scale to the athlete.
+
+    phase_t: 0.0 = wind-up start, 0.5 = peak impact, 1.0 = follow-through end.
+    kicking_side: "LEFT" or "RIGHT".
+
+    Three biomechanical rules are applied:
+      Rule 1 – Lean:      torso tilted 7.5 degrees forward from vertical.
+      Rule 2 – Wind-up:   kicking knee bent 20° extra during approach.
+      Rule 3 – Extension: kicking leg nearly straight (168°) at impact.
+    """
+    g = user_xy.copy()
+    leg = _RIGHT_LEG if kicking_side == "RIGHT" else _LEFT_LEG
+
+    def ok(*idxs: int) -> bool:
+        return all(np.all(np.isfinite(g[i])) for i in idxs)
+
+    # ── Rule 1: Torso forward lean ────────────────────────────────────────────
+    if ok(11, 12, 23, 24):
+        mid_hip = (g[23] + g[24]) * 0.5
+        mid_sh  = (g[11] + g[12]) * 0.5
+        torso   = mid_sh - mid_hip
+        t_len   = float(np.linalg.norm(torso))
+        if t_len > 1e-4:
+            # current lean from vertical (image y increases downward, so up = -y)
+            curr_lean = float(np.degrees(np.arctan2(torso[0], -torso[1])))
+            # forward direction = same horizontal sign as current torso lean
+            fwd = float(np.sign(curr_lean)) if abs(curr_lean) > 0.5 else 1.0
+            tgt_rad   = np.radians(fwd * _LEAN_TARGET_DEG)
+            new_torso = t_len * np.array([np.sin(tgt_rad), -np.cos(tgt_rad)])
+            sh_shift  = new_torso - torso
+            # Shift head, neck, shoulders and arms together
+            for idx in range(17):        # landmarks 0-16: face + shoulders + arms
+                if np.all(np.isfinite(g[idx])):
+                    g[idx] = g[idx] + sh_shift
+
+    k_hip   = leg["hip"]
+    k_knee  = leg["knee"]
+    k_ankle = leg["ankle"]
+    k_heel  = leg["heel"]
+    k_foot  = leg["foot"]
+
+    # ── Rule 2: Wind-up – deeper knee bend on the kicking leg ────────────────
+    wind_w = float(np.clip(1.0 - phase_t / 0.35, 0.0, 1.0))
+    if wind_w > 0.05 and ok(k_hip, k_knee, k_ankle):
+        curr = _joint_angle_deg(g[k_hip], g[k_knee], g[k_ankle])
+        tgt  = max(25.0, curr - _WINDUP_EXTRA_DEG * wind_w)
+        if curr - tgt > 1.0:
+            new_ankle = _set_joint_angle(g[k_hip], g[k_knee], g[k_ankle], tgt)
+            shift = new_ankle - g[k_ankle]
+            g[k_ankle] = g[k_ankle] + shift
+            if ok(k_heel): g[k_heel] = g[k_heel] + shift
+            if ok(k_foot): g[k_foot] = g[k_foot] + shift
+
+    # ── Rule 3: Impact – near-straight kicking leg ───────────────────────────
+    ext_w = float(np.clip(1.0 - abs(phase_t - 0.5) / 0.30, 0.0, 1.0))
+    if ext_w > 0.05 and ok(k_hip, k_knee, k_ankle):
+        curr = _joint_angle_deg(g[k_hip], g[k_knee], g[k_ankle])
+        tgt  = 155.0 + (_IMPACT_EXT_DEG - 155.0) * ext_w   # ramp up to 168°
+        if tgt - curr > 1.0:
+            new_ankle = _set_joint_angle(g[k_hip], g[k_knee], g[k_ankle], tgt)
+            shift = new_ankle - g[k_ankle]
+            g[k_ankle] = g[k_ankle] + shift
+            if ok(k_heel): g[k_heel] = g[k_heel] + shift
+            if ok(k_foot): g[k_foot] = g[k_foot] + shift
+
+    return g
 
 
 def _form_match_percent(
@@ -495,7 +560,6 @@ def process_video(
     min_tracking: float = 0.5,
 ) -> None:
     mp_pose = mp.solutions.pose
-    ghost_norm = build_perfect_strike_ghost()
     connections = [(int(a), int(b)) for a, b in mp_pose.POSE_CONNECTIONS]
 
     cap = cv2.VideoCapture(str(input_path))
@@ -575,6 +639,7 @@ def process_video(
         phase_end,
         frames_read,
     )
+    kicking_side = _detect_kicking_leg(smooth, vis, peak_idx)
 
     # --- Second pass: encode ---
     cap = cv2.VideoCapture(str(input_path))
@@ -615,10 +680,11 @@ def process_video(
         _draw_skeleton_lines(out, pts_user, connections, neon_blue, 3)
         _draw_skeleton_points(out, pts_user, neon_blue, 4)
 
-        ghost_g = _ghost_index_for_frame(fi, phase_start, phase_end)
+        in_phase = _in_strike_phase(fi, phase_start, phase_end)
         form_pct = 0.0
-        if ghost_g is not None:
-            g_norm = _transform_ghost_to_user(ghost_norm[ghost_g], u_norm, v_row)
+        if in_phase:
+            pt = _phase_t(fi, phase_start, phase_end)
+            g_norm = _generate_corrected_ghost(u_norm, v_row, pt, kicking_side)
             pts_ghost = np.zeros((33, 2), dtype=np.float64)
             for lm in range(33):
                 pts_ghost[lm, 0] = g_norm[lm, 0] * w
@@ -629,7 +695,7 @@ def process_video(
             _draw_skeleton_points(ghost_layer, pts_ghost, gold, 4)
             out = _blend_color_layer(out, ghost_layer, 0.55)
 
-            # Error vectors (dashed red)
+            # Error vectors: from user joint to corrected-ideal joint (dashed red)
             for lm in FORM_MATCH_LM_INDICES:
                 if v_row[lm] < 0.2:
                     continue
@@ -650,7 +716,7 @@ def process_video(
 
         # Form match text
         label = f"Form Match: {form_pct:.1f}%"
-        if ghost_g is None:
+        if not in_phase:
             label = "Form Match: -- (outside strike phase)"
         tw, th = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)[0]
         bx0, bx1 = 8, 8 + tw + 16
