@@ -236,7 +236,6 @@
       }
       video {
         width: 100%;
-        vertical-align: middle;
         display: block;
       }
       .result-actions {
@@ -265,6 +264,76 @@
         border-radius: 10px;
         padding: 10px 14px;
         font-size: 0.86rem;
+      }
+      .coach-panel {
+        margin-top: 18px;
+        padding: 14px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background: rgba(8, 12, 18, 0.72);
+      }
+      .coach-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .coach-score {
+        font-size: 2rem;
+        font-weight: 700;
+        color: var(--neon);
+      }
+      .coach-meta {
+        font-size: 0.82rem;
+        color: var(--muted);
+      }
+      .coach-list {
+        margin: 8px 0 0 0;
+        padding-left: 0;
+        list-style: none;
+        font-size: 0.92rem;
+      }
+      .coach-list li {
+        margin: 6px 0;
+      }
+      .coach-footer {
+        margin-top: 10px;
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        flex-wrap: wrap;
+        font-size: 0.78rem;
+        color: var(--muted);
+      }
+      .drills-block {
+        margin-top: 12px;
+        border-top: 1px solid var(--border);
+        padding-top: 10px;
+      }
+      .drills-title {
+        font-size: 0.82rem;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+        margin-bottom: 8px;
+      }
+      .drills-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .drill-card {
+        border: 1px solid rgba(0, 170, 255, 0.55);
+        border-radius: 10px;
+        background: rgba(8, 18, 28, 0.62);
+        padding: 10px;
+      }
+      .drill-title {
+        font-weight: 600;
+        font-size: 0.9rem;
+      }
+      .drill-text {
+        margin-top: 6px;
+        font-size: 0.8rem;
+        color: var(--muted);
       }
     </style>
   </head>
@@ -310,6 +379,45 @@
         <div class="report-wrap">
           <img id="report-image" alt="Biomechanical storyboard report" hidden />
         </div>
+        <section class="coach-panel" id="coach-panel" hidden>
+          <h3 style="margin: 0 0 8px 0">AI COACH VERDICT</h3>
+          <div class="coach-grid">
+            <div>
+              <div class="coach-score" id="coach-score">--%</div>
+              <div class="coach-meta">Overall Form Score</div>
+            </div>
+            <div class="coach-meta">
+              <div>Impact Speed: <span id="stat-impact-speed">--</span></div>
+              <div>Max Backswing Angle: <span id="stat-backswing">--</span></div>
+              <div>Torso Stability: <span id="stat-torso-stability">--</span></div>
+            </div>
+          </div>
+          <ul class="coach-list">
+            <li id="coach-strength">✅ --</li>
+            <li id="coach-weakness">❌ --</li>
+            <li id="coach-advice">💡 --</li>
+          </ul>
+          <div class="drills-block">
+            <div class="drills-title">NEXT STEPS: RECOMMENDED DRILLS</div>
+            <div class="drills-grid">
+              <article class="drill-card">
+                <div class="drill-title" id="drill1-title">🦵 --</div>
+                <div class="drill-text" id="drill1-text">--</div>
+              </article>
+              <article class="drill-card">
+                <div class="drill-title" id="drill2-title">🧱 --</div>
+                <div class="drill-text" id="drill2-text">--</div>
+              </article>
+            </div>
+          </div>
+          <div class="coach-footer">
+            <span>Hardware Acceleration: AMD Instinct™ MI300X | Framework: ROCm 6.0</span>
+            <span id="analysis-time-badge">Processed in --s</span>
+          </div>
+          <div style="margin-top:10px;">
+            <button type="button" class="btn-secondary" id="play-audio-btn">Play Audio Feedback</button>
+          </div>
+        </section>
         <div class="result-actions">
           <a id="report-link" class="report-link" href="#" hidden download>Download Full Report</a>
           <button type="button" class="btn-secondary" id="reset-btn">Reset</button>

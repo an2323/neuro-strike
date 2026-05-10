@@ -643,6 +643,92 @@ def _form_match_from_joint_errors(joint_errors: Dict[int, float]) -> float:
     return float(np.clip(100.0 * (1.0 - mean_v / JOINT_ERROR_MAX_DEG), 0.0, 100.0))
 
 
+def generate_coach_verdict(metrics: Dict[str, float]) -> Dict[str, Any]:
+    """
+    Build structured coaching verdict from analyzed metrics.
+
+    Returns dict with strengths, weaknesses, actionable_advice, and coaching_audio_text.
+    """
+    strengths: List[str] = []
+    weaknesses: List[str] = []
+
+    impact_speed = float(metrics.get("impact_speed", 0.0))
+    backswing_angle = float(metrics.get("max_backswing_angle", 0.0))
+    torso_stability = float(metrics.get("torso_stability", 0.0))
+    overall_form = float(metrics.get("overall_form_score", 0.0))
+    knee_extension = float(metrics.get("knee_extension_at_impact", 0.0))
+    lean_err = float(metrics.get("lean_error", 999.0))
+
+    if impact_speed >= 700.0:
+        strengths.append("High swing velocity")
+    if 70.0 <= backswing_angle <= 120.0:
+        strengths.append("Efficient backswing loading")
+    if torso_stability <= 7.0:
+        strengths.append("Stable torso control")
+    if overall_form >= 75.0:
+        strengths.append("Strong overall form consistency")
+    strengths = strengths[:2] if strengths else ["Good training intent and timing"]
+
+    biggest_issue = "Inconsistent knee extension"
+    if knee_extension < 150.0:
+        biggest_issue = "Inconsistent knee extension"
+    elif lean_err > 8.0:
+        biggest_issue = "Torso lean not controlled"
+    elif torso_stability > 11.0:
+        biggest_issue = "Torso stability drift"
+    elif overall_form < 60.0:
+        biggest_issue = "General form consistency is low"
+    weaknesses.append(biggest_issue)
+
+    if "knee" in biggest_issue.lower():
+        advice = "Drive your kicking knee through the ball and finish with a longer extension."
+    elif "lean" in biggest_issue.lower():
+        advice = "Lean your torso slightly forward through contact to keep the strike controlled and low."
+    elif "stability" in biggest_issue.lower():
+        advice = "Keep your core braced and chest quiet during the final swing to stabilize the strike path."
+    else:
+        advice = "Slow down your approach by one step and focus on matching the target body angles."
+
+    recommended_drills: List[Dict[str, str]] = []
+    if knee_extension < 155.0:
+        recommended_drills.append(
+            {
+                "title": "Hamstring Dynamic Stretches",
+                "instruction": "3 sets of 10 reps per leg to improve flexibility before strike practice.",
+                "icon": "🦵",
+            }
+        )
+    if torso_stability > 9.0:
+        recommended_drills.append(
+            {
+                "title": "Core Stability - Planks",
+                "instruction": "3 rounds of 45 seconds, keep hips level and core braced.",
+                "icon": "🧱",
+            }
+        )
+    if not recommended_drills:
+        recommended_drills.append(
+            {
+                "title": "Controlled Ball Strikes",
+                "instruction": "2 sets of 8 technical strikes focusing on repeatable body alignment.",
+                "icon": "⚽",
+            }
+        )
+
+    coaching_audio_text = (
+        f"Great work. Strengths: {', '.join(strengths)}. "
+        f"Main area to improve: {weaknesses[0]}. "
+        f"Coaching tip: {advice}"
+    )
+    return {
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "actionable_advice": advice,
+        "recommended_drills": recommended_drills[:2],
+        "coaching_audio_text": coaching_audio_text,
+    }
+
+
 def _draw_heatmap_skeleton(
     img: np.ndarray,
     pts_user: np.ndarray,
@@ -1169,6 +1255,9 @@ def process_video(
     kick_knee_idx = 26 if kicking_side == "RIGHT" else 25
     kick_hip_idx = 24 if kicking_side == "RIGHT" else 23
     kick_ank_idx = 28 if kicking_side == "RIGHT" else 27
+    phase_form_scores: List[float] = []
+    phase_torso_leans: List[float] = []
+    phase_knee_angles: List[Tuple[float, float]] = []
 
     while True:
         ret, frame = cap.read()
@@ -1200,6 +1289,13 @@ def process_video(
             joint_errors = _joint_error_map_deg(pts_user, pts_ideal)
             _draw_heatmap_skeleton(out, pts_user, joint_errors, kicking_side)
             form_pct = _form_match_from_joint_errors(joint_errors)
+            phase_form_scores.append(form_pct)
+            tl = _torso_lean_deg(pts_user)
+            if tl is not None:
+                phase_torso_leans.append(float(tl))
+            ka = _joint_angle_deg(pts_user, kick_hip_idx, kick_knee_idx, kick_ank_idx)
+            if ka is not None:
+                phase_knee_angles.append((phase_t, float(ka)))
 
             # Capture best frames for storyboard targets.
             for phase_name, target_t in STORYBOARD_PHASE_TARGETS:
@@ -1298,7 +1394,31 @@ def process_video(
     _try_ffmpeg_browser_mp4(output_path)
     _build_storyboard(report_path, snapshots, w, h, kicking_side)
     logger.info("Wrote storyboard report %s", report_path)
-    return {"video_path": str(output_path), "report_path": str(report_path)}
+    overall_form = float(np.mean(phase_form_scores)) if phase_form_scores else float(freeze_form_pct)
+    impact_speed = float(speeds_norm[peak_idx] * float(np.hypot(w, h))) if 0 <= peak_idx < speeds_norm.shape[0] else 0.0
+    backswing_vals = [ang for t, ang in phase_knee_angles if t <= 0.35]
+    max_backswing_angle = float(max(backswing_vals)) if backswing_vals else 0.0
+    impact_window = [ang for t, ang in phase_knee_angles if abs(t - 0.5) <= 0.08]
+    knee_extension_at_impact = float(np.mean(impact_window)) if impact_window else float(freeze_knee_ext or 0.0)
+    torso_stability = float(np.std(phase_torso_leans)) if phase_torso_leans else 0.0
+    mean_lean = float(np.mean(phase_torso_leans)) if phase_torso_leans else float(freeze_torso_lean or 0.0)
+    lean_error = abs(mean_lean - _LEAN_TARGET_DEG)
+    key_stats = {
+        "impact_speed": impact_speed,
+        "max_backswing_angle": max_backswing_angle,
+        "torso_stability": torso_stability,
+        "knee_extension_at_impact": knee_extension_at_impact,
+        "overall_form_score": overall_form,
+        "lean_error": lean_error,
+    }
+    coaching_data = generate_coach_verdict(key_stats)
+    coaching_data["overall_form_score"] = round(overall_form, 1)
+    coaching_data["key_stats"] = {
+        "impact_speed": round(impact_speed, 1),
+        "max_backswing_angle": round(max_backswing_angle, 1),
+        "torso_stability": round(torso_stability, 2),
+    }
+    return {"video_path": str(output_path), "report_path": str(report_path), "coaching_data": coaching_data}
 
 
 def main() -> None:

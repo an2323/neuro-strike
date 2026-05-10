@@ -23,7 +23,7 @@ import time
 import uuid
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, render_template, request, send_file
+from flask import Flask, abort, jsonify, render_template, request, send_file, url_for
 from werkzeug.utils import secure_filename
 
 # strike_video_processor pulls cv2 / mediapipe — import lazily so a broken numpy/opencv
@@ -92,6 +92,7 @@ def analyze_video():
         logger.exception("Failed to save upload")
         return jsonify({"ok": False, "error": f"Could not save upload: {e}"}), 500
 
+    t0 = time.time()
     try:
         result_meta = _run_process_video(upload_path, result_path)
     except ImportError as e:
@@ -153,8 +154,29 @@ def analyze_video():
     report_name = Path(
         result_meta.get("report_path", str(result_path.with_name(result_path.stem + "_storyboard.png")))
     ).name
-    logger.info("Analysis complete -> video=%s report=%s", video_name, report_name)
-    return jsonify({"ok": True, "video_filename": video_name, "report_filename": report_name})
+    analysis_time_sec = round(max(0.0, time.time() - t0), 2)
+    video_url = url_for("serve_result", filename=video_name)
+    report_url = url_for("serve_result", filename=report_name)
+    coaching_data = result_meta.get("coaching_data", {})
+    coaching_data["analysis_time_sec"] = analysis_time_sec
+    orbit_3d_url = None
+    orbit_meta = result_meta.get("orbit_3d_path")
+    if orbit_meta:
+        orbit_name = Path(str(orbit_meta)).name
+        orbit_path = RESULTS_DIR / orbit_name
+        if orbit_path.is_file():
+            orbit_3d_url = url_for("serve_result", filename=orbit_name)
+    payload = {
+        "ok": True,
+        "video_filename": video_name,
+        "report_filename": report_name,
+        "video_url": video_url,
+        "report_url": report_url,
+        "orbit_3d_url": orbit_3d_url,
+        "coaching_data": coaching_data,
+    }
+    logger.info("Analysis complete -> video=%s report=%s time=%.2fs", video_name, report_name, analysis_time_sec)
+    return jsonify(payload)
 
 
 @app.route("/results/<filename>")
