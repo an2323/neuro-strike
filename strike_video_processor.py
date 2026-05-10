@@ -693,9 +693,9 @@ def generate_coach_verdict(metrics: Dict[str, float]) -> Dict[str, Any]:
     if knee_extension < 155.0:
         recommended_drills.append(
             {
-                "title": "Hamstring Dynamic Stretches",
+                "title": "Hamstring Flexibility for Power",
                 "instruction": "3 sets of 10 reps per leg to improve flexibility before strike practice.",
-                "icon": "🦵",
+                "video_id": "YfEb9bLJN-Y",
             }
         )
     if torso_stability > 9.0:
@@ -703,15 +703,23 @@ def generate_coach_verdict(metrics: Dict[str, float]) -> Dict[str, Any]:
             {
                 "title": "Core Stability - Planks",
                 "instruction": "3 rounds of 45 seconds, keep hips level and core braced.",
-                "icon": "🧱",
+                "video_id": "LLmXxom7-GM",
+            }
+        )
+    if backswing_angle < 70.0:
+        recommended_drills.append(
+            {
+                "title": "Hip Mobility & Power",
+                "instruction": "15 seconds each side, 3 rounds; open the hips before striking drills.",
+                "video_id": "iVRIO7KkITU",
             }
         )
     if not recommended_drills:
         recommended_drills.append(
             {
-                "title": "Controlled Ball Strikes",
-                "instruction": "2 sets of 8 technical strikes focusing on repeatable body alignment.",
-                "icon": "⚽",
+                "title": "Hip Mobility & Power",
+                "instruction": "15 seconds each side, 3 rounds; keep hips free and explosive for cleaner backswing.",
+                "video_id": "iVRIO7KkITU",
             }
         )
 

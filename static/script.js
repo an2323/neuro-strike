@@ -20,8 +20,10 @@
   const coachStrength = document.getElementById("coach-strength");
   const coachWeakness = document.getElementById("coach-weakness");
   const coachAdvice = document.getElementById("coach-advice");
+  const drill1Video = document.getElementById("drill1-video");
   const drill1Title = document.getElementById("drill1-title");
   const drill1Text = document.getElementById("drill1-text");
+  const drill2Video = document.getElementById("drill2-video");
   const drill2Title = document.getElementById("drill2-title");
   const drill2Text = document.getElementById("drill2-text");
   const analysisTimeBadge = document.getElementById("analysis-time-badge");
@@ -107,9 +109,11 @@
     if (coachStrength) coachStrength.textContent = "✅ --";
     if (coachWeakness) coachWeakness.textContent = "❌ --";
     if (coachAdvice) coachAdvice.textContent = "💡 --";
-    if (drill1Title) drill1Title.textContent = "🦵 --";
+    if (drill1Video) drill1Video.src = "about:blank";
+    if (drill1Title) drill1Title.textContent = "--";
     if (drill1Text) drill1Text.textContent = "--";
-    if (drill2Title) drill2Title.textContent = "🧱 --";
+    if (drill2Video) drill2Video.src = "about:blank";
+    if (drill2Title) drill2Title.textContent = "--";
     if (drill2Text) drill2Text.textContent = "--";
     if (analysisTimeBadge) analysisTimeBadge.textContent = "Processed in --s";
     latestCoachingAudioText = "";
@@ -172,9 +176,12 @@
         const drills = Array.isArray(coaching.recommended_drills) ? coaching.recommended_drills : [];
         const d1 = drills[0] || {};
         const d2 = drills[1] || {};
-        if (drill1Title) drill1Title.textContent = `${d1.icon || "🦵"} ${d1.title || "--"}`;
+        const mkEmbed = (id) => id ? `https://www.youtube.com/embed/${encodeURIComponent(id)}` : "about:blank";
+        if (drill1Video) drill1Video.src = mkEmbed(d1.video_id);
+        if (drill1Title) drill1Title.textContent = d1.title || "--";
         if (drill1Text) drill1Text.textContent = d1.instruction || "--";
-        if (drill2Title) drill2Title.textContent = `${d2.icon || "🧱"} ${d2.title || "--"}`;
+        if (drill2Video) drill2Video.src = mkEmbed(d2.video_id);
+        if (drill2Title) drill2Title.textContent = d2.title || "--";
         if (drill2Text) drill2Text.textContent = d2.instruction || "--";
         if (analysisTimeBadge) {
           const t = Number(coaching.analysis_time_sec);
