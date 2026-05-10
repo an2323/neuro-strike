@@ -91,6 +91,9 @@ POWER_METER_REF_SPEED = 900.0
 # Mean normalized joint error below this maps toward 100% form match
 FORM_MATCH_SCALE = 0.12
 JOINT_ERROR_MAX_DEG = 30.0
+SUBJECT_MAX_CENTROID_JUMP = 0.16
+SUBJECT_MAX_HEIGHT_RATIO = 1.45
+SUBJECT_MIN_HEIGHT_RATIO = 0.62
 STORYBOARD_PHASE_TARGETS: Tuple[Tuple[str, float], ...] = (
     ("approach", 0.10),
     ("windup", 0.30),
@@ -182,6 +185,57 @@ def _forward_fill_landmarks(
             out_v[t] = np.maximum(out_v[t], 0.35)
         elif np.nanmax(out_v[t]) >= min_vis:
             last_good = out[t].copy()
+    return out, out_v
+
+
+def _pose_centroid_height(xy: np.ndarray, vis_row: np.ndarray) -> Tuple[Optional[np.ndarray], float]:
+    """Return subject centroid and approximate body height in normalized coords."""
+    idxs = (11, 12, 23, 24, 25, 26, 27, 28)
+    pts: List[np.ndarray] = []
+    for i in idxs:
+        if i >= xy.shape[0]:
+            continue
+        if not np.all(np.isfinite(xy[i])):
+            continue
+        if i < vis_row.shape[0] and float(vis_row[i]) < 0.2:
+            continue
+        pts.append(xy[i])
+    if len(pts) < 3:
+        return None, 0.0
+    arr = np.stack(pts, axis=0)
+    return np.mean(arr, axis=0), float(np.max(arr[:, 1]) - np.min(arr[:, 1]))
+
+
+def _stabilize_subject_track(seq: np.ndarray, vis: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Suppress sudden jumps to another person in the frame.
+
+    This keeps cinematic zoom and heatmap tied to one athlete.
+    """
+    out = seq.copy()
+    out_v = vis.copy()
+    prev_c: Optional[np.ndarray] = None
+    prev_h: Optional[float] = None
+    for t in range(out.shape[0]):
+        c, h = _pose_centroid_height(out[t], out_v[t])
+        if c is None or h <= 1e-6:
+            if t > 0:
+                out[t] = out[t - 1]
+                out_v[t] = out_v[t - 1] * 0.98
+            continue
+        if prev_c is not None and prev_h is not None and prev_h > 1e-6:
+            jump = float(np.linalg.norm(c - prev_c))
+            ratio = h / prev_h
+            switched = (
+                jump > SUBJECT_MAX_CENTROID_JUMP
+                and (ratio > SUBJECT_MAX_HEIGHT_RATIO or ratio < SUBJECT_MIN_HEIGHT_RATIO)
+            )
+            if switched and t > 0:
+                out[t] = out[t - 1]
+                out_v[t] = out_v[t - 1] * 0.985
+                c, h = _pose_centroid_height(out[t], out_v[t])
+        prev_c = c
+        prev_h = h
     return out, out_v
 
 
@@ -1055,6 +1109,7 @@ def process_video(
     seq = np.stack(raw_seq, axis=0)  # (T, 33, 2)
     vis = np.stack(raw_vis, axis=0)  # (T, 33)
     seq, vis = _forward_fill_landmarks(seq, vis)
+    seq, vis = _stabilize_subject_track(seq, vis)
 
     if savgol_filter is None:
         logger.warning("scipy not installed; install scipy for Savitzky–Golay smoothing.")
@@ -1106,7 +1161,7 @@ def process_video(
 
     fi = 0
     out_count = 0
-    base_skel_color = (190, 90, 30)  # dim blue base under heatmap
+    base_skel_color = (190, 90, 30)  # kept for optional fallback only
     freeze_source: Optional[np.ndarray] = None
     freeze_form_pct = 0.0
     freeze_knee_ext: Optional[float] = None
@@ -1130,9 +1185,7 @@ def process_video(
             pts_user[lm, 0] = u_norm[lm, 0] * w
             pts_user[lm, 1] = u_norm[lm, 1] * h
 
-        # Base user skeleton (dim) + phase heatmap overlay
-        _draw_skeleton_lines(out, pts_user, connections, base_skel_color, 2)
-        _draw_skeleton_points(out, pts_user, base_skel_color, 3)
+        # Draw only one skeleton layer (heatmap) to avoid duplicate visual outlines.
 
         in_phase = _in_strike_phase(fi, phase_start, phase_end)
         phase_t = _phase_t(fi, phase_start, phase_end) if in_phase else 0.0
@@ -1166,6 +1219,9 @@ def process_video(
                 freeze_form_pct = form_pct
                 freeze_knee_ext = _joint_angle_deg(pts_user, kick_hip_idx, kick_knee_idx, kick_ank_idx)
                 freeze_torso_lean = _torso_lean_deg(pts_user)
+        else:
+            # Outside strike phase, keep a single-color neutral heatmap skeleton.
+            _draw_heatmap_skeleton(out, pts_user, {}, kicking_side)
 
         # Power meter from normalized speed → px/s equivalent for display
         speed_px_equiv = speeds_norm[fi] * float(np.hypot(w, h))
