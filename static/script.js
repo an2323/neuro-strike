@@ -37,6 +37,13 @@
   const resetBtn = document.getElementById("reset-btn");
   const errorBanner = document.getElementById("error-banner");
   const fileLabel = document.querySelector('label[for="strike-file"]');
+  const aiCinematicWrap = document.getElementById("ai-cinematic-wrap");
+  const aiCinematicBtn = document.getElementById("ai-cinematic-btn");
+  const aiCinematicMissing = document.getElementById("ai-cinematic-missing");
+  const aiCinematicModal = document.getElementById("ai-cinematic-modal");
+  const aiCinematicVideo = document.getElementById("ai-cinematic-video");
+  const aiCinematicClose = document.getElementById("ai-cinematic-close");
+  const aiCinematicBackdrop = document.getElementById("ai-cinematic-backdrop");
 
   const STATUS_MESSAGES = [
     [
@@ -55,6 +62,23 @@
 
   let statusInterval = null;
   let latestCoachingAudioText = "";
+  let aiCinematicUrl = "";
+
+  function closeAiCinematicModal() {
+    if (aiCinematicModal) aiCinematicModal.hidden = true;
+    if (aiCinematicVideo) {
+      aiCinematicVideo.pause();
+      aiCinematicVideo.removeAttribute("src");
+      aiCinematicVideo.load();
+    }
+  }
+
+  function openAiCinematicModal(url) {
+    if (!aiCinematicModal || !aiCinematicVideo || !url) return;
+    aiCinematicVideo.src = url;
+    aiCinematicModal.hidden = false;
+    aiCinematicVideo.play().catch(() => {});
+  }
 
   function showError(msg) {
     errorBanner.textContent = msg || "Something went wrong.";
@@ -129,6 +153,11 @@
     if (scheduleRestday) scheduleRestday.textContent = "--";
     if (analysisTimeBadge) analysisTimeBadge.textContent = "Processed in --s";
     latestCoachingAudioText = "";
+    aiCinematicUrl = "";
+    if (aiCinematicWrap) aiCinematicWrap.hidden = true;
+    if (aiCinematicBtn) aiCinematicBtn.hidden = true;
+    if (aiCinematicMissing) aiCinematicMissing.hidden = true;
+    closeAiCinematicModal();
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
   }
 
@@ -158,6 +187,13 @@
       const reportName = data.report_filename;
       const videoUrl = data.video_url || (videoName ? `/results/${encodeURIComponent(videoName)}` : "");
       const reportUrl = data.report_url || (reportName ? `/results/${encodeURIComponent(reportName)}` : "");
+      aiCinematicUrl =
+        typeof data.ai_commentary_video_url === "string" && data.ai_commentary_video_url.length > 0
+          ? data.ai_commentary_video_url
+          : "";
+      if (aiCinematicWrap) aiCinematicWrap.hidden = false;
+      if (aiCinematicBtn) aiCinematicBtn.hidden = !aiCinematicUrl;
+      if (aiCinematicMissing) aiCinematicMissing.hidden = !!aiCinematicUrl;
       const coaching = data.coaching_data || {};
       if (!videoName) {
         showError("Missing result filename in response.");
@@ -224,6 +260,14 @@
   });
 
   resetBtn.addEventListener("click", resetUi);
+
+  if (aiCinematicBtn) {
+    aiCinematicBtn.addEventListener("click", () => {
+      if (aiCinematicUrl) openAiCinematicModal(aiCinematicUrl);
+    });
+  }
+  if (aiCinematicClose) aiCinematicClose.addEventListener("click", closeAiCinematicModal);
+  if (aiCinematicBackdrop) aiCinematicBackdrop.addEventListener("click", closeAiCinematicModal);
   if (playAudioBtn) {
     playAudioBtn.addEventListener("click", () => {
       if (!latestCoachingAudioText) return;

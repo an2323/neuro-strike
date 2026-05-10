@@ -19,3 +19,7 @@ numpy==1.26.4
 opencv-python-headless==4.9.0.80
 mediapipe==0.10.13
 scipy>=1.10.0,<1.14.0
+# Optional: AI narrated cinematic recap (process_video still works without these).
+# v1 uses moviepy.editor; v2 removed it — processor supports both.
+moviepy>=1.0.3
+gTTS>=2.5.0

@@ -227,6 +227,104 @@
       #result-section {
         margin-top: 24px;
       }
+      .cinematic-cta {
+        margin: 14px 0 4px;
+      }
+      .btn-cinematic {
+        width: 100%;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        font-size: 0.88rem;
+        box-shadow: var(--glow);
+      }
+      .cinematic-missing {
+        margin: 0;
+        padding: 14px 16px;
+        border-radius: 14px;
+        border: 1px dashed rgba(0, 240, 255, 0.35);
+        background: rgba(0, 240, 255, 0.06);
+        font-size: 0.84rem;
+        line-height: 1.55;
+        color: var(--muted);
+      }
+      .cinematic-missing strong {
+        color: var(--text);
+        display: block;
+        margin-bottom: 8px;
+        font-size: 0.88rem;
+      }
+      .cinematic-missing code {
+        display: inline-block;
+        margin-top: 6px;
+        padding: 6px 10px;
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.45);
+        border: 1px solid var(--border);
+        font-family: "JetBrains Mono", monospace;
+        font-size: 0.78rem;
+        color: #b8e8ff;
+        word-break: break-all;
+      }
+      .cinematic-modal {
+        position: fixed;
+        inset: 0;
+        z-index: 300;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+      }
+      .cinematic-modal[hidden] {
+        display: none !important;
+      }
+      .cinematic-modal__backdrop {
+        position: absolute;
+        inset: 0;
+        background: rgba(2, 4, 8, 0.78);
+        backdrop-filter: blur(6px);
+      }
+      .cinematic-modal__dialog {
+        position: relative;
+        z-index: 1;
+        width: min(920px, 96vw);
+        max-height: min(88vh, 900px);
+        background: linear-gradient(180deg, rgba(18, 24, 32, 0.98), rgba(8, 10, 14, 0.99));
+        border: 1px solid var(--neon);
+        border-radius: 18px;
+        padding: 18px 18px 20px;
+        box-shadow: 0 0 0 1px rgba(0, 240, 255, 0.12), 0 28px 80px rgba(0, 0, 0, 0.65);
+      }
+      .cinematic-modal__dialog h3 {
+        margin: 0 0 12px;
+        font-size: 1rem;
+        font-weight: 600;
+        color: var(--neon);
+        letter-spacing: 0.04em;
+      }
+      .cinematic-modal__close {
+        position: absolute;
+        top: 10px;
+        right: 12px;
+        border: none;
+        background: transparent;
+        color: var(--muted);
+        font-size: 1.6rem;
+        line-height: 1;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 8px;
+      }
+      .cinematic-modal__close:hover {
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.06);
+      }
+      .cinematic-modal__video {
+        width: 100%;
+        max-height: min(72vh, 720px);
+        border-radius: 12px;
+        background: #000;
+      }
       .video-shell {
         border-radius: 16px;
         overflow: hidden;
@@ -420,6 +518,21 @@
         <div class="video-shell">
           <video id="result-video" controls playsinline autoplay></video>
         </div>
+        <div class="cinematic-cta" id="ai-cinematic-wrap" hidden>
+          <button type="button" class="btn-primary btn-cinematic" id="ai-cinematic-btn" hidden>
+            WATCH AI NARRATED ANALYSIS
+          </button>
+          <div class="cinematic-missing" id="ai-cinematic-missing" hidden>
+            <strong>AI narrated cinematic recap</strong>
+            The server did not produce this MP4. Common causes: MoviePy/gTTS not installed in the
+            <em>same</em> Python venv as Waitress/Flask, or the export step failed (see server logs:
+            <code>AI cinematic commentary export failed</code>).
+            Install in that venv, then restart the app and analyze again:
+            <code>pip install moviepy gTTS</code>
+            (gTTS needs outbound network). If MoviePy is already installed, ensure it is importable as
+            <code>python -c "from moviepy.video.io.ImageSequenceClip import ImageSequenceClip"</code>.
+          </div>
+        </div>
         <div class="report-wrap">
           <img id="report-image" alt="Biomechanical storyboard report" hidden />
         </div>
@@ -500,6 +613,15 @@
           <a id="report-link" class="report-link" href="#" hidden download>Download Full Report</a>
           <button type="button" class="btn-secondary" id="reset-btn">Reset</button>
         </div>
+      </div>
+    </div>
+
+    <div id="ai-cinematic-modal" class="cinematic-modal" hidden>
+      <div class="cinematic-modal__backdrop" id="ai-cinematic-backdrop" aria-hidden="true"></div>
+      <div class="cinematic-modal__dialog" role="dialog" aria-modal="true" aria-labelledby="ai-cinematic-title">
+        <button type="button" class="cinematic-modal__close" id="ai-cinematic-close" aria-label="Close">&times;</button>
+        <h3 id="ai-cinematic-title">AI narrated cinematic analysis</h3>
+        <video id="ai-cinematic-video" class="cinematic-modal__video" controls playsinline></video>
       </div>
     </div>
 

@@ -14,10 +14,12 @@ Optional: pip install -r requirements_strike_video.txt (adds scipy for Savitzky�
 from __future__ import annotations
 
 import argparse
+import glob
 import logging
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -831,6 +833,651 @@ def _apply_digital_zoom(
     return cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
+def _kick_ankle_speed_norm(
+    seq: np.ndarray,
+    vis: np.ndarray,
+    fps: float,
+    kick_ank_idx: int,
+) -> np.ndarray:
+    """Per-frame kicking-ankle speed in normalized coords per second."""
+    t = int(seq.shape[0])
+    sp = np.zeros(t, dtype=np.float64)
+    dt = 1.0 / max(fps, 1e-3)
+    for i in range(1, t):
+        if vis[i, kick_ank_idx] > 0.2 and vis[i - 1, kick_ank_idx] > 0.2:
+            sp[i] = float(np.linalg.norm(seq[i, kick_ank_idx] - seq[i - 1, kick_ank_idx]) / dt)
+    return sp
+
+
+def _detect_cinematic_phases(
+    smooth: np.ndarray,
+    z_seq: np.ndarray,
+    vis: np.ndarray,
+    speeds_norm: np.ndarray,
+    peak_idx: int,
+    phase_start: int,
+    phase_end: int,
+    kicking_side: str,
+    fps: float,
+) -> Dict[str, Any]:
+    """
+    Landmark-driven indices for AI cinematic commentary (not fixed % of clip).
+
+    Returns backswing_peak_idx, impact_idx, follow_through_idx, plus scalar cues for TTS.
+    """
+    T = int(smooth.shape[0])
+    kick_ank = 28 if kicking_side == "RIGHT" else 27
+    stand_ank = 27 if kicking_side == "RIGHT" else 28
+    kick_hip = 24 if kicking_side == "RIGHT" else 23
+    kick_knee = 26 if kicking_side == "RIGHT" else 25
+
+    lo = int(np.clip(phase_start, 0, T - 1))
+    hi = int(np.clip(peak_idx, lo, T - 1))
+    win = slice(lo, hi + 1)
+
+    dx = smooth[win, kick_ank, 0] - smooth[win, stand_ank, 0]
+    dz = z_seq[win, kick_ank] - z_seq[win, stand_ank]
+    rng_x = float(np.nanmax(dx) - np.nanmin(dx)) if dx.size else 0.0
+    rng_z = float(np.nanmax(dz) - np.nanmin(dz)) if dz.size else 0.0
+    use_z_axis = rng_z > max(1e-5, rng_x * 0.45)
+
+    if use_z_axis:
+        sep = np.abs(dz)
+    else:
+        sep = np.abs(dx)
+    if sep.size == 0:
+        back_raw = lo
+    else:
+        back_raw = lo + int(np.argmax(sep))
+
+    sp_kick = _kick_ankle_speed_norm(smooth, vis, fps, kick_ank)
+    i0 = int(np.clip(phase_start, 0, T - 1))
+    i1 = int(np.clip(peak_idx, i0, T - 1))
+    if i1 > i0:
+        impact_raw = i0 + int(np.argmax(sp_kick[i0 : i1 + 1]))
+    else:
+        impact_raw = int(np.clip(peak_idx, phase_start, phase_end))
+
+    # Abrupt deceleration near peak (contact proxy)
+    p0 = max(phase_start, peak_idx - 6)
+    p1 = min(phase_end, peak_idx + 6)
+    if p1 > p0 + 2:
+        d1 = np.gradient(sp_kick[p0 : p1 + 1])
+        j = int(np.argmin(d1))
+        decel_idx = p0 + j
+        if abs(decel_idx - peak_idx) <= 5 and sp_kick[decel_idx] >= 0.55 * float(np.max(sp_kick[max(0, peak_idx - 3) : peak_idx + 4]) or 1.0):
+            impact_raw = int(np.clip(decel_idx, i0, i1))
+
+    foot_y = smooth[:, kick_ank, 1]
+    y_lo = max(phase_start, peak_idx - 8)
+    y_hi = min(phase_end, peak_idx + 8)
+    if y_hi > y_lo:
+        y_argmin = y_lo + int(np.argmin(foot_y[y_lo : y_hi + 1]))
+        if abs(y_argmin - impact_raw) <= 6:
+            impact_raw = y_argmin
+
+    impact_idx = int(np.clip(impact_raw, phase_start, min(phase_end, T - 1)))
+    backswing_peak_idx = int(np.clip(back_raw, phase_start, min(impact_idx, peak_idx, T - 1)))
+
+    ft_lo = min(T - 1, impact_idx + 1)
+    ft_hi = int(np.clip(phase_end, ft_lo, T - 1))
+    if ft_hi > ft_lo:
+        follow_raw = ft_lo + int(np.argmin(foot_y[ft_lo : ft_hi + 1]))
+    else:
+        follow_raw = ft_hi
+    follow_through_idx = int(np.clip(follow_raw, min(impact_idx + 1, T - 1), T - 1))
+
+    pts_b = np.zeros((33, 2), dtype=np.float64)
+    for lm in range(33):
+        pts_b[lm, 0] = smooth[backswing_peak_idx, lm, 0]
+        pts_b[lm, 1] = smooth[backswing_peak_idx, lm, 1]
+    backswing_angle = float(_joint_angle_deg(pts_b, kick_hip, kick_knee, kick_ank) or 0.0)
+
+    pts_i = np.zeros((33, 2), dtype=np.float64)
+    for lm in range(33):
+        pts_i[lm, 0] = smooth[impact_idx, lm, 0]
+        pts_i[lm, 1] = smooth[impact_idx, lm, 1]
+    lean_i = _torso_lean_deg(pts_i)
+    stab_window: List[float] = []
+    for fi in range(max(phase_start, impact_idx - 4), min(phase_end, impact_idx + 4) + 1):
+        ptn = np.zeros((33, 2), dtype=np.float64)
+        for lm in range(33):
+            ptn[lm, 0] = smooth[fi, lm, 0]
+            ptn[lm, 1] = smooth[fi, lm, 1]
+        tl = _torso_lean_deg(ptn)
+        if tl is not None:
+            stab_window.append(float(tl))
+    torso_std = float(np.std(stab_window)) if stab_window else 0.0
+    stability_score = float(np.clip(100.0 - torso_std * 6.0, 0.0, 100.0))
+
+    pts_f = np.zeros((33, 2), dtype=np.float64)
+    for lm in range(33):
+        pts_f[lm, 0] = smooth[follow_through_idx, lm, 0]
+        pts_f[lm, 1] = smooth[follow_through_idx, lm, 1]
+    knee_extension = float(_joint_angle_deg(pts_f, kick_hip, kick_knee, kick_ank) or 0.0)
+
+    return {
+        "backswing_peak_idx": backswing_peak_idx,
+        "impact_idx": impact_idx,
+        "follow_through_idx": follow_through_idx,
+        "backswing_axis_z": use_z_axis,
+        "backswing_angle_deg": backswing_angle,
+        "torso_stability_std_deg": torso_std,
+        "stability_score": stability_score,
+        "impact_lean_deg": float(lean_i or 0.0),
+        "follow_knee_extension_deg": knee_extension,
+    }
+
+
+def _map_point_after_digital_zoom(
+    pt_xy: Tuple[float, float],
+    center_xy: Tuple[float, float],
+    zoom: float,
+    w: int,
+    h: int,
+) -> Tuple[int, int]:
+    """Map a point from pre-zoom image coords to coords on the zoomed-and-resized canvas."""
+    zf = float(max(1.0, zoom))
+    cx = float(np.clip(center_xy[0], 0, w - 1))
+    cy = float(np.clip(center_xy[1], 0, h - 1))
+    crop_w = max(2, int(round(w / zf)))
+    crop_h = max(2, int(round(h / zf)))
+    x0 = int(round(cx - crop_w / 2))
+    y0 = int(round(cy - crop_h / 2))
+    x0 = int(np.clip(x0, 0, max(0, w - crop_w)))
+    y0 = int(np.clip(y0, 0, max(0, h - crop_h)))
+    jx, jy = float(pt_xy[0]), float(pt_xy[1])
+    u = (jx - float(x0)) * float(w) / float(crop_w)
+    v = (jy - float(y0)) * float(h) / float(crop_h)
+    return int(np.clip(round(u), 0, w - 1)), int(np.clip(round(v), 0, h - 1))
+
+
+def _freeze_zoom_circle_bgr(
+    base_bgr: np.ndarray,
+    center_xy: Tuple[float, float],
+    zoom: float,
+    circle_xy: Tuple[float, float],
+    radius: int = 26,
+) -> np.ndarray:
+    """Digital zoom then cyan circle (BGR) on the mapped joint."""
+    out = _apply_digital_zoom(base_bgr, center_xy, zoom)
+    h, w = out.shape[:2]
+    cx, cy = _map_point_after_digital_zoom(circle_xy, center_xy, zoom, w, h)
+    cv2.circle(out, (cx, cy), int(radius), (255, 255, 0), 3, cv2.LINE_AA)
+    return out
+
+
+def _compose_commentary_frame_bgr(
+    frame_bgr: np.ndarray,
+    fi: int,
+    smooth: np.ndarray,
+    vis: np.ndarray,
+    w: int,
+    h: int,
+    kicking_side: str,
+    phase_start: int,
+    phase_end: int,
+    speeds_norm: np.ndarray,
+) -> np.ndarray:
+    """Single heatmap overlay frame (matches main encode heatmap + meter + label)."""
+    out = frame_bgr.copy()
+    u_norm = smooth[fi]
+    v_row = vis[fi]
+    pts_user = np.zeros((33, 2), dtype=np.float64)
+    for lm in range(33):
+        pts_user[lm, 0] = u_norm[lm, 0] * w
+        pts_user[lm, 1] = u_norm[lm, 1] * h
+
+    in_phase = _in_strike_phase(fi, phase_start, phase_end)
+    phase_t = _phase_t(fi, phase_start, phase_end) if in_phase else 0.0
+    form_pct = 0.0
+    if in_phase:
+        ideal_norm = _generate_corrected_ghost(u_norm, v_row, phase_t, kicking_side)
+        pts_ideal = np.zeros((33, 2), dtype=np.float64)
+        for lm in range(33):
+            pts_ideal[lm, 0] = ideal_norm[lm, 0] * w
+            pts_ideal[lm, 1] = ideal_norm[lm, 1] * h
+        joint_errors = _joint_error_map_deg(pts_user, pts_ideal)
+        _draw_heatmap_skeleton(out, pts_user, joint_errors, kicking_side)
+        form_pct = _form_match_from_joint_errors(joint_errors)
+    else:
+        _draw_heatmap_skeleton(out, pts_user, {}, kicking_side)
+
+    speed_px_equiv = float(speeds_norm[fi] * float(np.hypot(w, h)))
+    fill = min(1.0, speed_px_equiv / POWER_METER_REF_SPEED)
+    _draw_power_meter(out, fill)
+
+    lbl = f"Form Match {form_pct:.0f}%"
+    if not in_phase:
+        lbl = "Form Match --"
+    knee_i = 26 if kicking_side == "RIGHT" else 25
+    ankle_i = 28 if kicking_side == "RIGHT" else 27
+    if _finite_pt(pts_user, knee_i):
+        tx, ty = int(round(pts_user[knee_i, 0])) + 10, int(round(pts_user[knee_i, 1])) - 10
+    elif _finite_pt(pts_user, ankle_i):
+        tx, ty = int(round(pts_user[ankle_i, 0])) + 10, int(round(pts_user[ankle_i, 1])) - 10
+    else:
+        tx, ty = 16, h - 24
+    tw, th_ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
+    tx = int(np.clip(tx, 8, max(8, w - tw - 12)))
+    ty = int(np.clip(ty, th_ + 8, max(th_ + 8, h - 8)))
+    cv2.rectangle(out, (tx - 6, ty - th_ - 6), (tx + tw + 6, ty + 6), (18, 18, 18), -1)
+    cv2.rectangle(out, (tx - 6, ty - th_ - 6), (tx + tw + 6, ty + 6), (255, 180, 40), 1)
+    cv2.putText(
+        out,
+        lbl,
+        (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (240, 250, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return out
+
+
+def _read_cap_frame(cap: cv2.VideoCapture, fi: int) -> Optional[np.ndarray]:
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+    ret, fr = cap.read()
+    return fr if ret else None
+
+
+def _gtts_to_mp3(text: str, out_mp3: Path) -> bool:
+    try:
+        from gtts import gTTS
+    except ImportError:
+        logger.warning("gTTS not installed; skipping narration audio (pip install gTTS).")
+        return False
+    try:
+        gTTS(text=text, lang="en").save(str(out_mp3))
+        return out_mp3.is_file()
+    except Exception as exc:  # pragma: no cover - network / IO
+        logger.warning("gTTS failed (%s); freeze segment will be silent.", exc)
+        return False
+
+
+def _import_moviepy_cinematic_bundle() -> Optional[Dict[str, Any]]:
+    """
+    MoviePy 1.x re-exports from ``moviepy.editor``; MoviePy 2.x removed that module.
+
+    Pip ``moviepy`` today resolves to v2, which previously triggered a misleading
+    "not installed" log when only ``from moviepy.editor import …`` failed.
+    """
+    try:
+        from moviepy.editor import (  # type: ignore[import-not-found]
+            AudioArrayClip,
+            AudioFileClip,
+            CompositeAudioClip,
+            ImageSequenceClip,
+            concatenate_audioclips,
+        )
+
+        ver = 1
+    except ImportError as exc_v1:
+        try:
+            from moviepy.audio.AudioClip import (
+                AudioArrayClip,
+                CompositeAudioClip,
+                concatenate_audioclips,
+            )
+            from moviepy.audio.io.AudioFileClip import AudioFileClip
+            from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
+        except ImportError as exc_v2:
+            try:
+                from moviepy import (
+                    AudioArrayClip,
+                    AudioFileClip,
+                    CompositeAudioClip,
+                    ImageSequenceClip,
+                    concatenate_audioclips,
+                )
+            except ImportError as exc_v3:
+                logger.warning(
+                    "AI cinematic: MoviePy import failed (install moviepy in the SAME Python venv as the app). "
+                    "v1 editor: %s | v2 submodules: %s | v2 top-level: %s",
+                    exc_v1,
+                    exc_v2,
+                    exc_v3,
+                )
+                return None
+        ver = 2
+
+    def audio_subclip(au: Any, t0: float, t1: float) -> Any:
+        if ver == 2:
+            return au.subclipped(t0, t1)
+        return au.subclip(t0, t1)
+
+    def audio_at(clip: Any, t: float) -> Any:
+        if ver == 2:
+            return clip.with_start(t)
+        return clip.set_start(t)
+
+    def video_with_audio(video: Any, audio: Any) -> Any:
+        if ver == 2:
+            return video.with_audio(audio)
+        return video.set_audio(audio)
+
+    return {
+        "ver": ver,
+        "ImageSequenceClip": ImageSequenceClip,
+        "AudioFileClip": AudioFileClip,
+        "AudioArrayClip": AudioArrayClip,
+        "CompositeAudioClip": CompositeAudioClip,
+        "concatenate_audioclips": concatenate_audioclips,
+        "audio_subclip": audio_subclip,
+        "audio_at": audio_at,
+        "video_with_audio": video_with_audio,
+    }
+
+
+def _try_build_ai_cinematic_commentary_video(
+    input_path: Path,
+    output_mp4: Path,
+    smooth: np.ndarray,
+    vis: np.ndarray,
+    z_seq: np.ndarray,
+    speeds_norm: np.ndarray,
+    peak_idx: int,
+    phase_start: int,
+    phase_end: int,
+    kicking_side: str,
+    fps: float,
+    w: int,
+    h: int,
+) -> bool:
+    """
+    Standalone narrated recap: intro → freeze (TTS) → slow transitions → outro.
+    Does not replace the primary annotated output.
+    """
+    M = _import_moviepy_cinematic_bundle()
+    if M is None:
+        return False
+    logger.info("AI cinematic: MoviePy bundle loaded (api_style=%s)", M["ver"])
+
+    ImageSequenceClip = M["ImageSequenceClip"]
+    AudioFileClip = M["AudioFileClip"]
+    AudioArrayClip = M["AudioArrayClip"]
+    CompositeAudioClip = M["CompositeAudioClip"]
+    concatenate_audioclips = M["concatenate_audioclips"]
+    _audio_subclip = M["audio_subclip"]
+    _audio_at = M["audio_at"]
+    _video_with_audio = M["video_with_audio"]
+
+    T = int(smooth.shape[0])
+    if T < 4 or w < 16 or h < 16:
+        return False
+
+    phases = _detect_cinematic_phases(
+        smooth, z_seq, vis, speeds_norm, peak_idx, phase_start, phase_end, kicking_side, fps
+    )
+    B = int(phases["backswing_peak_idx"])
+    I = int(phases["impact_idx"])
+    F = int(phases["follow_through_idx"])
+    if I < B:
+        I = min(B + 1, T - 1, phase_end)
+    if F <= I:
+        F = min(T - 1, max(I + 1, min(phase_end, peak_idx + 12, T - 1)))
+
+    kick_hip = 24 if kicking_side == "RIGHT" else 23
+    kick_knee = 26 if kicking_side == "RIGHT" else 25
+    stand_ank = 27 if kicking_side == "RIGHT" else 28
+
+    back_deg = float(phases["backswing_angle_deg"])
+    back_quality = "good" if 70.0 <= back_deg <= 130.0 else "low"
+    stab = float(phases["stability_score"])
+    torso_std = float(phases["torso_stability_std_deg"])
+    lean_i = float(phases["impact_lean_deg"])
+    knee_ext = float(phases["follow_knee_extension_deg"])
+
+    if stab >= 72.0 and torso_std <= 8.0:
+        stab_advice = "Hips and chest stay quiet — excellent balance through contact."
+    elif lean_i > 12.0:
+        stab_advice = "You are leaning back through impact; shift your chest slightly forward to stay over the ball."
+    elif lean_i < 4.0:
+        stab_advice = "Try a small forward torso angle through contact so the strike stays controlled and low."
+    else:
+        stab_advice = "Brace your core and keep the standing foot planted to reduce side-to-side sway."
+
+    if knee_ext >= 155.0:
+        knee_advice = "Nice long finish — keep driving the knee toward the target."
+    else:
+        knee_advice = "Reach a longer follow-through by letting the kicking knee travel farther forward after contact."
+
+    tts1 = (
+        f"Notice the backswing angle of {back_deg:.0f} degrees. "
+        f"This is {back_quality} for generating power."
+    )
+    tts2 = (
+        f"At impact, your torso stability score is {stab:.0f} out of one hundred. {stab_advice}"
+    )
+    tts3 = f"Final extension check. Your knee angle is {knee_ext:.0f} degrees. {knee_advice}"
+
+    freeze1_sec = 4.0
+    freeze2_sec = 5.0
+    freeze3_sec = 4.0
+    slow_rep = 5
+
+    cap: Optional[cv2.VideoCapture] = None
+    tmp_root = Path(tempfile.mkdtemp(prefix="ns_ai_cine_"))
+    seq_dir = tmp_root / "frames"
+    seq_dir.mkdir(parents=True, exist_ok=True)
+    tts1_mp3 = tmp_root / "freeze1.mp3"
+    tts2_mp3 = tmp_root / "freeze2.mp3"
+    tts3_mp3 = tmp_root / "freeze3.mp3"
+    _gtts_to_mp3(tts1, tts1_mp3)
+    _gtts_to_mp3(tts2, tts2_mp3)
+    _gtts_to_mp3(tts3, tts3_mp3)
+
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        try:
+            cap.release()
+        except Exception:
+            pass
+        cap = None
+        return False
+
+    def grab_bgr(fi: int) -> Optional[np.ndarray]:
+        assert cap is not None
+        fr = _read_cap_frame(cap, fi)
+        if fr is None:
+            return None
+        return _compose_commentary_frame_bgr(
+            fr,
+            fi,
+            smooth,
+            vis,
+            w,
+            h,
+            kicking_side,
+            phase_start,
+            phase_end,
+            speeds_norm,
+        )
+
+    idx = 0
+
+    def dump_rgb(rgb: np.ndarray) -> None:
+        nonlocal idx
+        p = seq_dir / f"{idx:06d}.png"
+        cv2.imwrite(str(p), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        idx += 1
+
+    try:
+        for fi in range(0, B + 1):
+            bgr = grab_bgr(fi)
+            if bgr is None:
+                continue
+            dump_rgb(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+
+        fb = grab_bgr(B)
+        if fb is None:
+            raise RuntimeError("missing backswing frame")
+        hip_mid = (
+            float(smooth[B, 23, 0] + smooth[B, 24, 0]) * 0.5 * w,
+            float(smooth[B, 23, 1] + smooth[B, 24, 1]) * 0.5 * h,
+        )
+        hip_circle = (
+            float(smooth[B, kick_hip, 0] * w),
+            float(smooth[B, kick_hip, 1] * h),
+        )
+        fz1 = _freeze_zoom_circle_bgr(fb, hip_mid, 1.5, hip_circle, 28)
+        n1 = max(1, int(round(freeze1_sec * fps)))
+        rgb1 = cv2.cvtColor(fz1, cv2.COLOR_BGR2RGB)
+        for _ in range(n1):
+            dump_rgb(rgb1.copy())
+
+        for fi in range(B, I + 1):
+            bgr = grab_bgr(fi)
+            if bgr is None:
+                continue
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            for _ in range(slow_rep):
+                dump_rgb(rgb.copy())
+
+        fi_imp = I
+        bi = grab_bgr(fi_imp)
+        if bi is None:
+            raise RuntimeError("missing impact frame")
+        stand_xy = (float(smooth[I, stand_ank, 0] * w), float(smooth[I, stand_ank, 1] * h))
+        torso_c = (
+            float(smooth[I, 11, 0] + smooth[I, 12, 0]) * 0.5 * w,
+            float(smooth[I, 11, 1] + smooth[I, 12, 1]) * 0.5 * h,
+        )
+        zoom_c = (0.5 * (stand_xy[0] + torso_c[0]), 0.5 * (stand_xy[1] + torso_c[1]))
+        fz2 = _freeze_zoom_circle_bgr(bi, zoom_c, 2.0, stand_xy, 30)
+        n2 = max(1, int(round(freeze2_sec * fps)))
+        rgb2 = cv2.cvtColor(fz2, cv2.COLOR_BGR2RGB)
+        for _ in range(n2):
+            dump_rgb(rgb2.copy())
+
+        for fi in range(I, F + 1):
+            bgr = grab_bgr(fi)
+            if bgr is None:
+                continue
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            for _ in range(slow_rep):
+                dump_rgb(rgb.copy())
+
+        bf = grab_bgr(F)
+        if bf is None:
+            raise RuntimeError("missing follow-through frame")
+        knee_xy = (float(smooth[F, kick_knee, 0] * w), float(smooth[F, kick_knee, 1] * h))
+        fz3 = _freeze_zoom_circle_bgr(bf, knee_xy, 1.5, knee_xy, 26)
+        n3 = max(1, int(round(freeze3_sec * fps)))
+        rgb3 = cv2.cvtColor(fz3, cv2.COLOR_BGR2RGB)
+        for _ in range(n3):
+            dump_rgb(rgb3.copy())
+
+        for fi in range(F + 1, T):
+            bgr = grab_bgr(fi)
+            if bgr is None:
+                continue
+            dump_rgb(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+
+        frame_files = sorted(
+            glob.glob(str(seq_dir / "*.png")),
+            key=lambda p: int(Path(p).stem),
+        )
+        if not frame_files:
+            raise RuntimeError("no frames exported")
+
+        # MoviePy 2: keep with_mask=False so ffmpeg_writer never touches a half-built mask.
+        video_clip = ImageSequenceClip(frame_files, fps=float(fps), with_mask=False)
+
+        def fit_audio(path: Path, dur: float) -> Any:
+            if not path.is_file():
+                sr = 44100
+                n = max(1, int(round(dur * sr)))
+                arr = np.zeros((n, 2), dtype=np.float32)
+                return AudioArrayClip(arr, fps=sr)
+            au = AudioFileClip(str(path))
+            d = float(au.duration)
+            if d > dur + 1e-3:
+                # Do not close ``au`` here — MoviePy 2 subclips can still delegate to the reader.
+                return _audio_subclip(au, 0, dur)
+            if d < dur - 1e-3:
+                gap = dur - d
+                sr = int(getattr(au, "fps", 44100) or 44100)
+                n = max(1, int(round(gap * sr)))
+                arr = np.zeros((n, 2), dtype=np.float32)
+                silent = AudioArrayClip(arr, fps=sr)
+                return concatenate_audioclips([au, silent])
+            return au
+
+        intro_dur = (B + 1) / max(fps, 1e-3)
+        t1 = intro_dur
+        d_f1 = float(n1) / max(fps, 1e-3)
+        d_t1 = (max(I, B) - B + 1) * slow_rep / max(fps, 1e-3)
+        t2 = t1 + d_f1 + d_t1
+        d_f2 = float(n2) / max(fps, 1e-3)
+        d_t2 = (F - I + 1) * slow_rep / max(fps, 1e-3)
+        t3 = t2 + d_f2 + d_t2
+        d_f3 = float(n3) / max(fps, 1e-3)
+
+        silent_intro = AudioArrayClip(
+            np.zeros((max(1, int(round(intro_dur * 44100))), 2), dtype=np.float32),
+            fps=44100,
+        )
+        silent_t1 = AudioArrayClip(
+            np.zeros((max(1, int(round(d_t1 * 44100))), 2), dtype=np.float32),
+            fps=44100,
+        )
+        silent_t2 = AudioArrayClip(
+            np.zeros((max(1, int(round(d_t2 * 44100))), 2), dtype=np.float32),
+            fps=44100,
+        )
+        outro_n = max(0, T - 1 - F)
+        outro_dur = outro_n / max(fps, 1e-3)
+        silent_out = AudioArrayClip(
+            np.zeros((max(1, int(round(outro_dur * 44100))), 2), dtype=np.float32),
+            fps=44100,
+        )
+
+        a_intro = _audio_at(silent_intro, 0.0)
+        a_f1 = _audio_at(fit_audio(tts1_mp3, d_f1), t1)
+        a_t1 = _audio_at(silent_t1, t1 + d_f1)
+        a_f2 = _audio_at(fit_audio(tts2_mp3, d_f2), t2)
+        a_t2 = _audio_at(silent_t2, t2 + d_f2)
+        a_f3 = _audio_at(fit_audio(tts3_mp3, d_f3), t3)
+        a_out = _audio_at(silent_out, t3 + d_f3)
+
+        full_audio = CompositeAudioClip([a_intro, a_f1, a_t1, a_f2, a_t2, a_f3, a_out])
+        final = _video_with_audio(video_clip, full_audio)
+        if getattr(final, "audio", None) is None:
+            raise RuntimeError("MoviePy did not attach composite audio to the video clip")
+
+        output_mp4.parent.mkdir(parents=True, exist_ok=True)
+        final.write_videofile(
+            str(output_mp4),
+            codec="libx264",
+            audio_codec="aac",
+            temp_audiofile=str(tmp_root / "temp-audio.m4a"),
+            remove_temp=True,
+            fps=float(fps),
+            logger=None,
+        )
+        final.close()
+        video_clip.close()
+        full_audio.close()
+        silent_intro.close()
+        silent_t1.close()
+        silent_t2.close()
+        silent_out.close()
+        return output_mp4.is_file()
+    except Exception:
+        logger.exception("AI cinematic commentary export failed")
+        return False
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
 def _var_zoom_factor(phase_t: float) -> float:
     """Linear zoom ramp: 1.0 -> 1.5 -> 1.0 through slow-mo window."""
     t = float(np.clip(phase_t, 0.0, 1.0))
@@ -1182,7 +1829,7 @@ def process_video(
     output_path: Path,
     min_detection: float = 0.5,
     min_tracking: float = 0.5,
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     mp_pose = mp.solutions.pose
     connections = [(int(a), int(b)) for a, b in mp_pose.POSE_CONNECTIONS]
 
@@ -1206,6 +1853,7 @@ def process_video(
 
     raw_seq: List[np.ndarray] = []
     raw_vis: List[np.ndarray] = []
+    raw_z: List[np.ndarray] = []
     frames_read = 0
 
     while True:
@@ -1216,6 +1864,7 @@ def process_video(
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         res = pose.process(rgb)
         xy = np.full((33, 2), np.nan, dtype=np.float64)
+        z_row = np.full(33, np.nan, dtype=np.float64)
         v = np.zeros(33, dtype=np.float64)
         if res.pose_landmarks:
             for idx, lm in enumerate(res.pose_landmarks.landmark):
@@ -1223,9 +1872,11 @@ def process_video(
                     break
                 xy[idx, 0] = float(lm.x)
                 xy[idx, 1] = float(lm.y)
+                z_row[idx] = float(lm.z)
                 v[idx] = float(lm.visibility)
         raw_seq.append(xy)
         raw_vis.append(v)
+        raw_z.append(z_row)
 
     cap.release()
     pose.close()
@@ -1235,8 +1886,10 @@ def process_video(
 
     seq = np.stack(raw_seq, axis=0)  # (T, 33, 2)
     vis = np.stack(raw_vis, axis=0)  # (T, 33)
+    z_seq = np.stack(raw_z, axis=0)  # (T, 33) — depth prior for camera-aware backswing axis
     seq, vis = _forward_fill_landmarks(seq, vis)
     seq, vis = _stabilize_subject_track(seq, vis)
+    z_seq = np.nan_to_num(z_seq, nan=0.0, posinf=0.0, neginf=0.0)
 
     if savgol_filter is None:
         logger.warning("scipy not installed; install scipy for Savitzky–Golay smoothing.")
@@ -1246,6 +1899,8 @@ def process_video(
     for lm in range(33):
         for d in range(2):
             smooth[:, lm, d] = _savgol_1d(seq[:, lm, d])
+    for j in (23, 24, 25, 26, 27, 28):
+        z_seq[:, j] = _savgol_1d(z_seq[:, j])
     # S-G can yield NaN at edges or where input had gaps; fall back to raw seq then center.
     bad = ~np.isfinite(smooth)
     if np.any(bad):
@@ -1459,7 +2114,34 @@ def process_video(
         "max_backswing_angle": round(max_backswing_angle, 1),
         "torso_stability": round(torso_stability, 2),
     }
-    return {"video_path": str(output_path), "report_path": str(report_path), "coaching_data": coaching_data}
+
+    ai_out = output_path.with_name(output_path.stem + "_ai_cinematic_analysis.mp4")
+    ok_ai = _try_build_ai_cinematic_commentary_video(
+        input_path,
+        ai_out,
+        smooth,
+        vis,
+        z_seq,
+        speeds_norm,
+        peak_idx,
+        phase_start,
+        phase_end,
+        kicking_side,
+        fps,
+        w,
+        h,
+    )
+    if ok_ai:
+        logger.info("Wrote AI cinematic commentary %s", ai_out)
+
+    result: Dict[str, Any] = {
+        "video_path": str(output_path),
+        "report_path": str(report_path),
+        "coaching_data": coaching_data,
+    }
+    if ok_ai and ai_out.is_file():
+        result["ai_commentary_video_path"] = str(ai_out)
+    return result
 
 
 def main() -> None:
