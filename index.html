@@ -86,6 +86,29 @@
       .server-config button {
         padding: 8px 16px;
       }
+      .server-config-meta {
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px solid #24392e;
+        font-size: 0.8rem;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+      .server-config-meta code {
+        font-size: 0.78rem;
+        color: #b8e6c8;
+        background: #0c1010;
+        padding: 2px 6px;
+        border-radius: 6px;
+      }
+      .server-config-meta a {
+        color: var(--neon);
+        text-decoration: none;
+        font-weight: 600;
+      }
+      .server-config-meta a:hover {
+        text-decoration: underline;
+      }
       .connection-indicator {
         display: inline-block;
         width: 10px;
@@ -271,8 +294,8 @@
           <input
             id="serverIpInput"
             type="text"
-            value="165.245.131.174"
-            placeholder="e.g. 165.245.131.174"
+            value="165.245.128.59"
+            placeholder="e.g. 165.245.128.59"
           />
           <button id="connectBtn">Connect</button>
           <span
@@ -285,6 +308,17 @@
             ></span>
             <span id="connLabel">Disconnected</span>
           </span>
+          <div class="server-config-meta">
+            Live training uses <code>remote_main.py</code> on
+            <code>ws://&lt;IP&gt;:8080/ws</code>. Strike Lab (MP4 ghost overlay) is a
+            separate app on port 5050 —
+            <a
+              id="strikeLabLink"
+              href="#"
+              target="_blank"
+              rel="noopener noreferrer"
+              >open Strike Lab</a>.
+          </div>
         </div>
 
         <div class="stage">
@@ -356,6 +390,17 @@
       const connectBtn = document.getElementById("connectBtn");
       const connIndicator = document.getElementById("connIndicator");
       const connLabel = document.getElementById("connLabel");
+      const strikeLabLink = document.getElementById("strikeLabLink");
+
+      function updateStrikeLabLink() {
+        if (!strikeLabLink) return;
+        const ip = serverIpInput.value.trim();
+        if (!ip) {
+          strikeLabLink.removeAttribute("href");
+          return;
+        }
+        strikeLabLink.href = `http://${ip}:5050/`;
+      }
 
       let ws;
       let audioCtx;
@@ -1118,6 +1163,9 @@
 
       // AMD Server Connect/Disconnect
       connectBtn.addEventListener("click", connectToRemote);
+      serverIpInput.addEventListener("input", updateStrikeLabLink);
+      serverIpInput.addEventListener("change", updateStrikeLabLink);
+      updateStrikeLabLink();
 
       // Allow Enter key in IP input to trigger connect
       serverIpInput.addEventListener("keydown", (e) => {

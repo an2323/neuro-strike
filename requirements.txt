@@ -1,0 +1,21 @@
+# NeuroStrike Strike Lab (Flask + MediaPipe offline processor)
+#
+# Install:
+#   source neurostrike_env/bin/activate
+#   pip install -r requirements.txt
+#   bash scripts/fix_venv_opencv_numpy.sh
+#
+# You MUST run the fix script after pip: mediapipe declares opencv-contrib-python,
+# which installs a second cv2 and often breaks numpy/cv2 (and can leave a corrupt
+# "~umpy" tree if an uninstall was interrupted).
+#
+# Remote WS stack (requirements_remote.txt) can hit the same issue — run the same
+# fix script there if `import cv2` fails.
+
+flask>=3.0.0
+werkzeug>=3.0.0
+waitress>=3.0.0
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
+mediapipe==0.10.13
+scipy>=1.10.0,<1.14.0

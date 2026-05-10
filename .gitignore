@@ -20,6 +20,7 @@ htmlcov/
 # Local runtime artifacts
 .mplcache/
 uploads/
+results/
 models/*.task
 *.log
 

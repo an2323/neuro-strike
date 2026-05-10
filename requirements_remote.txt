@@ -2,6 +2,9 @@
 # Linux-optimized packages for cloud deployment
 # NOTE: Install opencv-python-headless BEFORE mediapipe to prevent
 #       mediapipe from pulling in opencv-contrib-python (GUI version)
+#
+# If `import cv2` / numpy errors appear, mediapipe still pulled opencv-contrib-python.
+# With venv active:  bash scripts/fix_venv_opencv_numpy.sh
 
 # Core Framework
 fastapi==0.109.0

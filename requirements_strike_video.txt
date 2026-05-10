@@ -1,0 +1,7 @@
+# Offline strike video post-processor (strike_video_processor.py)
+# Install: pip install -r requirements_strike_video.txt
+
+mediapipe==0.10.13
+opencv-python-headless==4.9.0.80
+numpy>=1.26.4,<2.0.0
+scipy>=1.10.0,<1.14.0

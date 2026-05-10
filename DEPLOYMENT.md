@@ -5,7 +5,7 @@
 ### 1. SSH into the AMD Server
 
 ```bash
-ssh root@165.245.131.174
+ssh root@165.245.128.59
 ```
 
 ### 2. Update System & Install Dependencies
@@ -160,8 +160,8 @@ tmux attach -t neurostrike
 ### 10. Connect from the Frontend
 
 1. Open `index.html` in a browser (served locally or from any web server)
-2. The **AMD Server IP** field is pre-filled with `165.245.131.174`
-3. Click **Connect** — the indicator should turn green and show "Connected to 165.245.131.174"
+2. The **AMD Server IP** field is pre-filled with `165.245.128.59`
+3. Click **Connect** — the indicator should turn green and show "Connected to 165.245.128.59"
 4. Click **Start Training** to begin sending frames to the AMD server
 
 ---
@@ -183,7 +183,7 @@ tmux attach -t neurostrike
 
 | Setting          | Value             | Description                       |
 | ---------------- | ----------------- | --------------------------------- |
-| Server IP        | `165.245.131.174` | AMD MI300X server address         |
+| Server IP        | `165.245.128.59` | AMD MI300X server address         |
 | Port             | `8080`            | WebSocket & HTTP port             |
 | Model Complexity | `2`               | Maximum MediaPipe precision       |
 | GPU              | ROCm (MI300X)     | AMD GPU acceleration              |
