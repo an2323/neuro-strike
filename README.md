@@ -37,6 +37,26 @@ Optimization steps applied:
 
 Versus CPU, the current measured speedup is **~5.0x** while preserving stable tracking. We did not benchmark NVIDIA directly; the result shows this workload can run on an open **AMD ROCm + MI300X + ONNX Runtime + MIGraphX** stack instead of requiring CUDA.
 
+## Strike Lab Pipeline
+
+```mermaid
+flowchart TD
+    A[Browser uploads MP4 / MOV] --> B[Strike Lab web app<br/>Flask + Waitress]
+    B --> C[Save upload<br/>uploads/]
+    C --> D[strike_video_processor.process_video]
+    D --> E[Decode frames<br/>OpenCV]
+    E --> F[Pose tracking<br/>MediaPipe accuracy mode<br/>or ONNX ROCm path]
+    F --> G[Biomechanics preprocessing<br/>smoothing + valid-frame handling]
+    G --> H[Three-phase kick analysis<br/>backswing, contact, follow-through]
+    H --> I[Coaching feedback<br/>strengths, weaknesses, drills]
+    I --> J[gTTS narration<br/>based on feedback]
+    H --> K[Overlay + cinematic render<br/>pauses, zooms, heatmap/ghost]
+    J --> K
+    K --> L[MoviePy export]
+    L --> M[FFmpeg remux<br/>browser-ready MP4]
+    M --> N[Browser response<br/>MP4 + storyboard PNG + JSON]
+```
+
 The repo contains **three runnable surfaces** that share the same biomechanical ideas but target different workflows:
 
 | Component | Role |
