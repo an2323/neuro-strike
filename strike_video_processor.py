@@ -863,7 +863,10 @@ def _detect_cinematic_phases(
     """
     Landmark-driven indices for AI cinematic commentary (not fixed % of clip).
 
-    Returns backswing_peak_idx, impact_idx, follow_through_idx, plus scalar cues for TTS.
+    Approach / jog often maximises *max(left, right)* ankle speed while the kicking foot is
+    not clearly faster than the plant foot. We therefore locate the strike with a smoothed
+    **kick / plant** ankle-speed ratio (and a foot-speed valley) instead of the global peak
+    index alone, then place backswing / impact in a short pre-contact window around that peak.
     """
     T = int(smooth.shape[0])
     kick_ank = 28 if kicking_side == "RIGHT" else 27
@@ -871,9 +874,45 @@ def _detect_cinematic_phases(
     kick_hip = 24 if kicking_side == "RIGHT" else 23
     kick_knee = 26 if kicking_side == "RIGHT" else 25
 
-    lo = int(np.clip(phase_start, 0, T - 1))
-    hi = int(np.clip(peak_idx, lo, T - 1))
-    win = slice(lo, hi + 1)
+    fps_m = max(float(fps), 1e-3)
+    sp_kick = _kick_ankle_speed_norm(smooth, vis, fps, kick_ank)
+    sp_stand = _kick_ankle_speed_norm(smooth, vis, fps, stand_ank)
+    ratio = sp_kick / (sp_stand + 1e-6)
+    ratio = np.clip(ratio, 0.0, 80.0)
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float64)
+    kernel /= float(np.sum(kernel))
+    ratio_s = np.convolve(ratio, kernel, mode="same")
+
+    lo_c = int(np.clip(max(phase_start, int(0.05 * T)), 0, T - 1))
+    hi_c = int(np.clip(min(phase_end, max(lo_c + 2, T - 2)), 0, T - 1))
+    if hi_c <= lo_c:
+        lo_c, hi_c = max(0, T // 10), max(lo_c + 1, T - 2)
+
+    win_r = ratio_s[lo_c : hi_c + 1]
+    sig = float(np.max(win_r)) if win_r.size else 0.0
+    if win_r.size > 0 and sig > 1.05:
+        pk = lo_c + int(np.argmax(win_r))
+    else:
+        pk = int(np.clip(peak_idx, lo_c, hi_c))
+
+    pk = int(np.clip(pk, lo_c, hi_c))
+
+    # Start of the final strike burst: walk back from pk until kicking foot is no longer "hot".
+    peak_sp = float(np.max(sp_kick[max(0, pk - 4) : min(T, pk + 5)]) or 1.0)
+    thr_sp = 0.32 * peak_sp
+    t = pk
+    while t > phase_start and sp_kick[t] > thr_sp:
+        t -= 1
+    burst_start = t + 1
+    # Never search earlier than ~2.5 s before contact (still excludes long jogs).
+    cine_lo = int(np.clip(max(phase_start, burst_start, pk - int(2.5 * fps_m)), 0, max(0, pk - 2)))
+    if cine_lo >= pk:
+        cine_lo = max(phase_start, pk - max(10, int(0.35 * fps_m)))
+
+    pre_peak_coil = max(int(round(0.52 * fps_m)), 6)
+    back_lo = int(np.clip(max(cine_lo, pk - pre_peak_coil), 0, max(0, pk - 1)))
+    back_hi = pk
+    win = slice(back_lo, back_hi + 1)
 
     dx = smooth[win, kick_ank, 0] - smooth[win, stand_ank, 0]
     dz = z_seq[win, kick_ank] - z_seq[win, stand_ank]
@@ -886,38 +925,37 @@ def _detect_cinematic_phases(
     else:
         sep = np.abs(dx)
     if sep.size == 0:
-        back_raw = lo
+        back_raw = back_lo
     else:
-        back_raw = lo + int(np.argmax(sep))
+        back_raw = back_lo + int(np.argmax(sep))
 
-    sp_kick = _kick_ankle_speed_norm(smooth, vis, fps, kick_ank)
-    i0 = int(np.clip(phase_start, 0, T - 1))
-    i1 = int(np.clip(peak_idx, i0, T - 1))
+    i0 = int(np.clip(cine_lo, 0, T - 1))
+    i1 = int(np.clip(pk, i0, T - 1))
     if i1 > i0:
         impact_raw = i0 + int(np.argmax(sp_kick[i0 : i1 + 1]))
     else:
-        impact_raw = int(np.clip(peak_idx, phase_start, phase_end))
+        impact_raw = int(np.clip(pk, phase_start, phase_end))
 
     # Abrupt deceleration near peak (contact proxy)
-    p0 = max(phase_start, peak_idx - 6)
-    p1 = min(phase_end, peak_idx + 6)
+    p0 = max(cine_lo, pk - 6)
+    p1 = min(phase_end, pk + 6)
     if p1 > p0 + 2:
         d1 = np.gradient(sp_kick[p0 : p1 + 1])
         j = int(np.argmin(d1))
         decel_idx = p0 + j
-        if abs(decel_idx - peak_idx) <= 5 and sp_kick[decel_idx] >= 0.55 * float(np.max(sp_kick[max(0, peak_idx - 3) : peak_idx + 4]) or 1.0):
+        if abs(decel_idx - pk) <= 5 and sp_kick[decel_idx] >= 0.55 * float(np.max(sp_kick[max(0, pk - 3) : pk + 4]) or 1.0):
             impact_raw = int(np.clip(decel_idx, i0, i1))
 
     foot_y = smooth[:, kick_ank, 1]
-    y_lo = max(phase_start, peak_idx - 8)
-    y_hi = min(phase_end, peak_idx + 8)
+    y_lo = max(cine_lo, pk - 8)
+    y_hi = min(phase_end, pk + 8)
     if y_hi > y_lo:
         y_argmin = y_lo + int(np.argmin(foot_y[y_lo : y_hi + 1]))
         if abs(y_argmin - impact_raw) <= 6:
             impact_raw = y_argmin
 
-    impact_idx = int(np.clip(impact_raw, phase_start, min(phase_end, T - 1)))
-    backswing_peak_idx = int(np.clip(back_raw, phase_start, min(impact_idx, peak_idx, T - 1)))
+    impact_idx = int(np.clip(impact_raw, cine_lo, min(phase_end, pk, T - 1)))
+    backswing_peak_idx = int(np.clip(back_raw, back_lo, min(impact_idx, pk, T - 1)))
 
     ft_lo = min(T - 1, impact_idx + 1)
     ft_hi = int(np.clip(phase_end, ft_lo, T - 1))
@@ -960,6 +998,7 @@ def _detect_cinematic_phases(
         "backswing_peak_idx": backswing_peak_idx,
         "impact_idx": impact_idx,
         "follow_through_idx": follow_through_idx,
+        "cinematic_peak_idx": pk,
         "backswing_axis_z": use_z_axis,
         "backswing_angle_deg": backswing_angle,
         "torso_stability_std_deg": torso_std,
@@ -1080,6 +1119,34 @@ def _read_cap_frame(cap: cv2.VideoCapture, fi: int) -> Optional[np.ndarray]:
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
     ret, fr = cap.read()
     return fr if ret else None
+
+
+def _ffprobe_audio_duration_seconds(path: Path) -> Optional[float]:
+    """Return container duration in seconds for an audio file, or None if unavailable."""
+    if not path.is_file():
+        return None
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=60,
+        ).strip()
+        return float(out)
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return None
 
 
 def _gtts_to_mp3(text: str, out_mp3: Path) -> bool:
@@ -1215,46 +1282,83 @@ def _try_build_ai_cinematic_commentary_video(
     F = int(phases["follow_through_idx"])
     if I < B:
         I = min(B + 1, T - 1, phase_end)
+    cine_pk = int(phases.get("cinematic_peak_idx", peak_idx))
     if F <= I:
-        F = min(T - 1, max(I + 1, min(phase_end, peak_idx + 12, T - 1)))
+        F = min(
+            T - 1,
+            max(I + 1, min(phase_end, cine_pk + max(12, int(0.35 * fps)), T - 1)),
+        )
 
     kick_hip = 24 if kicking_side == "RIGHT" else 23
     kick_knee = 26 if kicking_side == "RIGHT" else 25
     stand_ank = 27 if kicking_side == "RIGHT" else 28
 
     back_deg = float(phases["backswing_angle_deg"])
-    back_quality = "good" if 70.0 <= back_deg <= 130.0 else "low"
     stab = float(phases["stability_score"])
     torso_std = float(phases["torso_stability_std_deg"])
     lean_i = float(phases["impact_lean_deg"])
     knee_ext = float(phases["follow_knee_extension_deg"])
 
-    if stab >= 72.0 and torso_std <= 8.0:
-        stab_advice = "Hips and chest stay quiet — excellent balance through contact."
-    elif lean_i > 12.0:
-        stab_advice = "You are leaning back through impact; shift your chest slightly forward to stay over the ball."
-    elif lean_i < 4.0:
-        stab_advice = "Try a small forward torso angle through contact so the strike stays controlled and low."
+    # Narration: qualitative coaching copy (no numeric "scores" for gTTS).
+    if 70.0 <= back_deg <= 130.0:
+        tts1 = (
+            "In the backswing, hip and knee loading look well set — there is a strong coil here for a clean strike."
+        )
+    elif back_deg < 55.0:
+        tts1 = (
+            "The wind-up looks quite compact. Try a slightly deeper backswing so the leg can accelerate through a longer range."
+        )
+    elif back_deg < 70.0:
+        tts1 = (
+            "There is room to load the leg more in the backswing — a bit more pullback will help you generate power through contact."
+        )
     else:
-        stab_advice = "Brace your core and keep the standing foot planted to reduce side-to-side sway."
+        tts1 = (
+            "The backswing looks quite open through hip and knee. Aim for a tighter coil so you unwind into the ball with control."
+        )
+
+    if stab >= 72.0 and torso_std <= 8.0:
+        tts2 = (
+            "Through contact, your trunk and hips stay impressively quiet — that stability is what you want for a crisp strike."
+        )
+    elif lean_i > 12.0:
+        tts2 = (
+            "Through impact, the torso is leaning back away from the ball. "
+            "Shift the chest slightly forward so you stay over the strike and hold balance."
+        )
+    elif lean_i < 4.0:
+        tts2 = (
+            "You are quite upright at impact. A gentle forward angle through the chest helps keep the shot driven and low."
+        )
+    elif torso_std > 10.0:
+        tts2 = (
+            "There is noticeable side-to-side movement in the trunk around impact. "
+            "Brace the core and keep the standing foot planted so the upper body stays quieter."
+        )
+    else:
+        tts2 = (
+            "Stability through impact is acceptable, but some sway remains. "
+            "Treat the standing leg as an anchor and keep the ribs stacked over the hips."
+        )
 
     if knee_ext >= 155.0:
-        knee_advice = "Nice long finish — keep driving the knee toward the target."
+        tts3 = (
+            "On the finish, the kicking leg shows strong extension — keep driving that knee toward the target after contact."
+        )
+    elif knee_ext >= 140.0:
+        tts3 = (
+            "Follow-through is decent, but the finish could be longer. "
+            "Let the kicking knee travel farther forward after the ball is gone."
+        )
     else:
-        knee_advice = "Reach a longer follow-through by letting the kicking knee travel farther forward after contact."
-
-    tts1 = (
-        f"Notice the backswing angle of {back_deg:.0f} degrees. "
-        f"This is {back_quality} for generating power."
-    )
-    tts2 = (
-        f"At impact, your torso stability score is {stab:.0f} out of one hundred. {stab_advice}"
-    )
-    tts3 = f"Final extension check. Your knee angle is {knee_ext:.0f} degrees. {knee_advice}"
+        tts3 = (
+            "The follow-through looks a little short on knee extension. "
+            "Release the leg forward so the strike stays long and committed."
+        )
 
     freeze1_sec = 4.0
     freeze2_sec = 5.0
-    freeze3_sec = 4.0
+    freeze3_sec = 6.5
     slow_rep = 5
 
     cap: Optional[cv2.VideoCapture] = None
@@ -1267,6 +1371,11 @@ def _try_build_ai_cinematic_commentary_video(
     _gtts_to_mp3(tts1, tts1_mp3)
     _gtts_to_mp3(tts2, tts2_mp3)
     _gtts_to_mp3(tts3, tts3_mp3)
+    dur3 = _ffprobe_audio_duration_seconds(tts3_mp3)
+    if dur3 is not None:
+        freeze3_sec = min(16.0, max(6.0, float(dur3) + 1.4))
+    else:
+        freeze3_sec = max(freeze3_sec, 8.5)
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
