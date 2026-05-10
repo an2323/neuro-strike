@@ -5,7 +5,7 @@
 # Usage (from repo root):
 #   ./upload.sh
 #   ./upload.sh 165.245.131.174          # explicit host (overrides default IP)
-#   NEUROSTRIKE_SERVER_IP=165.245.128.59 ./upload.sh
+#   NEUROSTRIKE_SERVER_IP=165.245.133.50 ./upload.sh
 #   SSH_KEY=~/.ssh/id_ed25519_amd ./upload.sh
 #
 # Remote path is fixed: root@<IP>:/root/
@@ -18,7 +18,7 @@ cd "$ROOT"
 SERVER_USER="${NEUROSTRIKE_SERVER_USER:-root}"
 SERVER_PATH="${NEUROSTRIKE_SERVER_PATH:-/root}"
 # First argument overrides IP; else env; else default below.
-SERVER_IP="${1:-${NEUROSTRIKE_SERVER_IP:-165.245.128.59}}"
+SERVER_IP="${1:-${NEUROSTRIKE_SERVER_IP:-165.245.133.50}}"
 
 # Optional identity file (common for this project).
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519_amd}"
@@ -35,6 +35,7 @@ FILES=(
   remote_main.py
   main.py
   app.py
+  pose_gpu.py
   strike_video_processor.py
   requirements_remote.txt
   requirements.txt

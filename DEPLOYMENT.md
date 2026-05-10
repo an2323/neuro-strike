@@ -5,83 +5,192 @@
 ### 1. SSH into the AMD Server
 
 ```bash
-ssh root@165.245.128.59
+ssh root@165.245.133.50
 ```
 
-### 2. Update System & Install Dependencies
+---
+
+### 2. Update System & Install Core Dependencies
 
 ```bash
-# Update package lists
 apt-get update
+apt-get install -y python3 python3-pip python3-venv build-essential cmake wget gnupg2 ffmpeg
+```
 
-# Install Python 3, pip, venv, and build tools
-apt-get install -y python3 python3-pip python3-venv build-essential cmake
+---
 
-# Install ROCm drivers (if not already installed for MI300X)
-# Verify ROCm installation:
+### 3. Install ROCm 6.x + MIGraphX (AMD GPU runtime)
+
+MI300X requires ROCm 6.x. MIGraphX is AMD's native inference engine used by
+`onnxruntime-rocm` to run pose estimation on the GPU.
+
+```bash
+# Add AMD GPG key
+wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
+  gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+
+# Add ROCm 6.2 repo (Ubuntu 22.04 / jammy — adjust codename if on a different distro)
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] \
+  https://repo.radeon.com/rocm/apt/6.2 jammy main" \
+  | tee /etc/apt/sources.list.d/rocm.list
+
+# Install ROCm runtime + MIGraphX
+apt-get update
+apt-get install -y rocm-hip-runtime rocm-dev rocm-smi-lib migraphx half
+
+# Add root to GPU device groups
+usermod -aG render,video root
+
+# Verify hardware is visible
 rocm-smi
-# If ROCm is not installed, follow: https://rocm.docs.amd.com/en/latest/deploy/linux/install.html
+# Expected: table showing AMD Instinct MI300X
+
+rocminfo | grep -i "name"
+# Expected: lines including "gfx942"
 ```
 
-### 3. Verify Files Were Uploaded
+---
+
+### 4. Verify Files Were Uploaded
 
 ```bash
-# Check that upload.sh ran successfully
-ls -la /root/remote_main.py /root/requirements_remote.txt
+# After running ./upload.sh on your local machine:
+ls -la /root/remote_main.py /root/requirements_remote.txt /root/pose_gpu.py \
+        /root/scripts/download_blazepose_onnx.sh
 ```
 
-### 4. Create Python Virtual Environment & Install Packages
+---
+
+### 5. Create Python Virtual Environment & Install Packages
 
 ```bash
-# Navigate to the upload directory
 cd /root
-
-# Create a virtual environment
 python3 -m venv neurostrike_env
-
-# Activate it
 source neurostrike_env/bin/activate
-
-# Upgrade pip
 pip install --upgrade pip
 
-# Install all dependencies (Linux-optimized for AMD MI300X)
+# Install base deps (mediapipe stays as CPU fallback)
 pip install -r requirements_remote.txt
+
+# Install onnxruntime with ROCm + MIGraphX EP (replaces plain onnxruntime)
+# Use the repo matching the server's ROCm version (check: cat /opt/rocm/.info/version)
+pip install onnxruntime-rocm \
+  --extra-index-url https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0/
+
+# Fix OpenCV / NumPy conflicts if needed
+bash scripts/fix_venv_opencv_numpy.sh
 ```
 
-### 5. Verify MediaPipe Works with ROCm GPU
+---
+
+### 6. ROCm 7.0 hipBLAS Compatibility Shim (already applied on current droplet)
+
+`onnxruntime-rocm` references two hipBLAS symbols (`hipblasGemmEx_v2`,
+`hipblasGemmStridedBatchedEx_v2`) that were renamed in ROCm 7.0. A thin
+forwarding shim is required to bridge the gap.
 
 ```bash
-# Quick test that MediaPipe can initialize
+mkdir -p /root/lib/rocm-compat
+
+# SO-version symlinks (onnxruntime expects .so.6/.so.2, ROCm 7.0 ships .so.7/.so.3)
+ln -sf /opt/rocm/lib/libamdhip64.so.7  /root/lib/rocm-compat/libamdhip64.so.6
+ln -sf /opt/rocm/lib/libhipblas.so.3   /root/lib/rocm-compat/libhipblas.so.2
+
+# Compile the _v2 symbol shim (forwards to ROCm 7.0 base functions)
+cat > /tmp/hipblas_shim.c << 'EOF'
+#include <hipblas/hipblas.h>
+hipblasStatus_t hipblasGemmEx_v2(
+    hipblasHandle_t h, hipblasOperation_t ta, hipblasOperation_t tb,
+    int m, int n, int k, const void* alpha,
+    const void* A, hipDataType at, int lda,
+    const void* B, hipDataType bt, int ldb,
+    const void* beta,
+    void* C, hipDataType ct, int ldc,
+    hipDataType ct2, hipblasGemmAlgo_t algo) {
+    return hipblasGemmEx(h,ta,tb,m,n,k,alpha,A,at,lda,B,bt,ldb,beta,C,ct,ldc,ct2,algo);
+}
+hipblasStatus_t hipblasGemmStridedBatchedEx_v2(
+    hipblasHandle_t h, hipblasOperation_t ta, hipblasOperation_t tb,
+    int m, int n, int k, const void* alpha,
+    const void* A, hipDataType at, int lda, long long int sa,
+    const void* B, hipDataType bt, int ldb, long long int sb,
+    const void* beta,
+    void* C, hipDataType ct, int ldc, long long int sc,
+    int bc, hipDataType ct2, hipblasGemmAlgo_t algo) {
+    return hipblasGemmStridedBatchedEx(h,ta,tb,m,n,k,alpha,A,at,lda,sa,B,bt,ldb,sb,beta,C,ct,ldc,sc,bc,ct2,algo);
+}
+EOF
+gcc -shared -fPIC -O2 -o /root/lib/rocm-compat/libhipblas_shim.so /tmp/hipblas_shim.c \
+  -I/opt/rocm/include -L/opt/rocm/lib -lhipblas -Wl,-rpath,/opt/rocm/lib
+
+# Inject into venv activate (idempotent)
+grep -q 'rocm-compat' /root/neurostrike_env/bin/activate || cat >> /root/neurostrike_env/bin/activate << 'ENVEOF'
+export LD_LIBRARY_PATH="/root/lib/rocm-compat:/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_PRELOAD="/root/lib/rocm-compat/libhipblas_shim.so${LD_PRELOAD:+:$LD_PRELOAD}"
+ENVEOF
+```
+
+---
+
+### 7. Download BlazePose ONNX Models
+
+```bash
+cd /root
+source neurostrike_env/bin/activate
+bash scripts/download_blazepose_onnx.sh
+# Expected output: two model files in models/
+#   models/pose_detection.onnx       (~2 MB)
+#   models/pose_landmark_heavy.onnx  (~25 MB)
+```
+
+---
+
+### 7. Verify GPU Inference Stack
+
+```bash
+source neurostrike_env/bin/activate
+
+# Check MIGraphX EP is available in onnxruntime
 python3 -c "
-import mediapipe as mp
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(model_complexity=2)
-print('✓ MediaPipe initialized successfully with model_complexity=2')
-pose.close()
+import onnxruntime as ort
+providers = ort.get_available_providers()
+print('Providers:', providers)
+assert 'MIGraphXExecutionProvider' in providers, 'MIGraphX EP not found — check ROCm install'
+print('OK: MIGraphX EP available')
+"
+
+# Load BlazePoseONNX and run a smoke test
+python3 -c "
+import numpy as np
+from pose_gpu import BlazePoseONNX
+bp = BlazePoseONNX()
+print('MIGraphX active:', bp.using_migraphx)
+dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+res = bp.process(dummy)
+print('Smoke test OK (pose_landmarks:', res.pose_landmarks, ')')
 "
 ```
 
-### 6. Open Firewall Port (if ufw is active)
+---
+
+### 8. Open Firewall Port (if ufw is active)
 
 ```bash
-# Allow incoming connections on port 8080
 ufw allow 8080/tcp
 ufw status
 ```
 
-### 7. Start the Backend Server
+---
+
+### 9. Start the Backend Server
 
 **Option A — Run in tmux session (recommended for persistence):**
 
 ```bash
-# Install tmux if not available
 apt-get install -y tmux
-
-# Create a new tmux session
 tmux new-session -s neurostrike
 
-# Inside tmux, activate venv and start the server
+# Inside tmux:
 cd /root
 source neurostrike_env/bin/activate
 python3 remote_main.py
@@ -119,49 +228,52 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-# Enable and start the service
 systemctl daemon-reload
 systemctl enable neurostrike.service
 systemctl start neurostrike.service
-
-# Check status
 systemctl status neurostrike.service
 ```
 
-### 8. Verify the Server is Running
+---
+
+### 10. Verify the Server is Running
 
 ```bash
-# Check the health endpoint
+# Standard health check
 curl http://localhost:8080/health
+# Expected: {"status":"healthy","analyzer_ready":true,...}
 
-# Expected response:
-# {"status":"healthy","analyzer_ready":true,"active_sessions":0,"max_sessions":10,"timestamp":...}
+# GPU status (new endpoint — confirms ROCm is actually used)
+curl http://localhost:8080/gpu-status
+# Expected: {"rocm_available":true,"migraphx_provider":true,"pose_backend":"blazepose-onnx-MIGraphX",...}
 
-# Check the root endpoint
+# Root endpoint
 curl http://localhost:8080/
-
-# Expected response includes:
-# {"service":"NeuroStrike Remote Backend","status":"online","model_complexity":2,...}
+# Expected: {...,"gpu_enabled":true,"gpu_backend":"ROCm MIGraphX (AMD MI300X)",...}
 ```
 
-### 9. Monitor Logs
+---
+
+### 11. Monitor Logs
 
 ```bash
-# If using systemd:
+# systemd:
 journalctl -u neurostrike.service -f
 
-# If using nohup:
+# nohup:
 tail -f /root/neurostrike.log
 
-# If using tmux: simply attach to the session
+# tmux:
 tmux attach -t neurostrike
 ```
 
-### 10. Connect from the Frontend
+---
+
+### 12. Connect from the Frontend
 
 1. Open `index.html` in a browser (served locally or from any web server)
-2. The **AMD Server IP** field is pre-filled with `165.245.128.59`
-3. Click **Connect** — the indicator should turn green and show "Connected to 165.245.128.59"
+2. The **AMD Server IP** field is pre-filled with `165.245.133.50`
+3. Click **Connect** — the indicator should turn green and show "Connected to 165.245.133.50"
 4. Click **Start Training** to begin sending frames to the AMD server
 
 ---
@@ -169,24 +281,25 @@ tmux attach -t neurostrike
 ## Architecture Overview
 
 ```
-┌─────────────────────┐         WebSocket          ┌──────────────────────────┐
-│   Browser (index.html)  │ ──────────────────────▶ │  AMD MI300X Server       │
-│                         │ ◀────────────────────── │  remote_main.py          │
-│  • Camera/Video Input   │    ws://IP:8080/ws      │  • MediaPipe Pose (GPU)  │
-│  • Skeleton Overlay     │                         │  • model_complexity=2    │
-│  • Latency Monitor      │                         │  • Connection Pool (max) │
-│  • AMD Server Connect   │                         │  • Per-session Queue     │
-└─────────────────────┘                           └──────────────────────────┘
+┌─────────────────────┐         WebSocket          ┌──────────────────────────────────┐
+│   Browser (index.html)  │ ──────────────────────▶ │  AMD MI300X Server               │
+│                         │ ◀────────────────────── │  remote_main.py                  │
+│  • Camera/Video Input   │    ws://IP:8080/ws      │  • BlazePose ONNX (MIGraphX GPU) │
+│  • Skeleton Overlay     │                         │  • MediaPipe CPU fallback         │
+│  • Latency Monitor      │                         │  • Connection Pool (max 10)       │
+│  • AMD Server Connect   │                         │  • Per-session Queue              │
+└─────────────────────┘                           └──────────────────────────────────┘
 ```
 
 ## Configuration Reference
 
-| Setting          | Value             | Description                       |
-| ---------------- | ----------------- | --------------------------------- |
-| Server IP        | `165.245.128.59` | AMD MI300X server address         |
-| Port             | `8080`            | WebSocket & HTTP port             |
-| Model Complexity | `2`               | Maximum MediaPipe precision       |
-| GPU              | ROCm (MI300X)     | AMD GPU acceleration              |
-| Max Sessions     | `10`              | Concurrent connection limit       |
-| Session Queue    | `8` frames        | Per-connection frame buffer       |
-| Frame Rate Limit | `33 FPS`          | Max frames per second per session |
+| Setting          | Value             | Description                            |
+| ---------------- | ----------------- | -------------------------------------- |
+| Server IP        | `165.245.133.50`  | AMD MI300X server address              |
+| Port             | `8080`            | WebSocket & HTTP port                  |
+| Pose backend     | BlazePose ONNX    | MIGraphX EP (GPU) → MediaPipe (CPU)    |
+| Model Complexity | `2` (heavy)       | Maximum BlazePose precision            |
+| GPU              | ROCm / MIGraphX   | AMD GPU acceleration via onnxruntime   |
+| Max Sessions     | `10`              | Concurrent connection limit            |
+| Session Queue    | `8` frames        | Per-connection frame buffer            |
+| Frame Rate Limit | `33 FPS`          | Max frames per second per session      |

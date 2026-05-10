@@ -361,6 +361,23 @@ class FootballAnalyzer:
         self._TaskImage = None
         self._TaskImageFormat = None
 
+        # --- GPU path: BlazePose ONNX via MIGraphX (AMD MI300X) ---
+        # Priority: ONNX GPU → MediaPipe Tasks → MediaPipe legacy Pose (CPU)
+        self._onnx: object = None
+        self._use_onnx_gpu = False
+        try:
+            from pose_gpu import BlazePoseONNX  # type: ignore[import]
+            self._onnx = BlazePoseONNX()
+            self._use_onnx_gpu = True
+            logger.info(
+                "FootballAnalyzer: BlazePose ONNX GPU (MIGraphX=%s)",
+                getattr(self._onnx, "using_migraphx", False),
+            )
+            return  # skip MediaPipe init entirely
+        except Exception as _e:
+            logger.info("BlazePose ONNX unavailable (%s); falling back to MediaPipe", _e)
+
+        # --- MediaPipe Tasks (multi-person, CPU) ---
         try:
             from mediapipe.tasks.python import vision as tasks_vision
             from mediapipe.tasks.python.core import base_options as task_base
@@ -469,7 +486,37 @@ class FootballAnalyzer:
         rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         debug_rejected_keypoints: List[Dict[str, Dict[str, float]]] = []
 
-        if self._use_tasks and self._landmarker is not None:
+        # ---- GPU path (BlazePose ONNX via MIGraphX) ----
+        if self._use_onnx_gpu and self._onnx is not None:
+            res = self._onnx.process(rgb)  # type: ignore[union-attr]
+            if not res.pose_landmarks:
+                return {
+                    "status": "NO_POSE",
+                    "reason": "no_pose",
+                    "keypoints": {},
+                    "kick_speed": 0.0,
+                    "knee_angle": 180.0,
+                    "posture_consistency_score": 0.0,
+                    "metrics": {},
+                    "voice_feedback": None,
+                    "chosen_centroid": None,
+                    "debug_rejected_keypoints": debug_rejected_keypoints,
+                    "inference_time_ms": round((time.perf_counter() - start) * 1000, 2),
+                    "timestamp_ms": now_ms,
+                }
+            raw_keypoints = self._extract_all_keypoints(res.pose_landmarks, w, h)
+            lh = raw_keypoints.get("LEFT_HIP")
+            rh = raw_keypoints.get("RIGHT_HIP")
+            chosen_centroid: Tuple[float, float]
+            if lh and rh and w > 0 and h > 0:
+                chosen_centroid = (
+                    (lh["x"] / w + rh["x"] / w) * 0.5,
+                    (lh["y"] / h + rh["y"] / h) * 0.5,
+                )
+            else:
+                chosen_centroid = (0.5, 0.5)
+            # fast_motion and keypoints are computed in the shared block below
+        elif self._use_tasks and self._landmarker is not None:
             self._frame_ts += 33
             mp_image = self._TaskImage(
                 image_format=self._TaskImageFormat.SRGB,
@@ -974,7 +1021,8 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing NeuroStrike Remote Backend (AMD MI300X)...")
     try:
         analyzer = FootballAnalyzer()
-        logger.info("✓ MediaPipe Pose initialized successfully (GPU: ROCm)")
+        backend = "BlazePose ONNX (MIGraphX GPU)" if getattr(analyzer, "_use_onnx_gpu", False) else "MediaPipe CPU"
+        logger.info("✓ FootballAnalyzer initialized — backend: %s", backend)
     except Exception as e:
         logger.error(f"✗ Failed to initialize MediaPipe: {e}")
         analyzer = None
@@ -1022,8 +1070,8 @@ async def root():
         "model_complexity": 2,
         "active_connections": connection_pool.active_count,
         "max_connections": MAX_CONCURRENT_SESSIONS,
-        "gpu_enabled": os.environ.get("MEDIAPIPE_DISABLE_GPU", "1") == "0",
-        "gpu_backend": "ROCm (AMD MI300X)",
+        "gpu_enabled": analyzer is not None and getattr(analyzer, "_use_onnx_gpu", False),
+        "gpu_backend": "ROCm MIGraphX (AMD MI300X)" if (analyzer and getattr(analyzer, "_use_onnx_gpu", False)) else "CPU",
     })
 
 
@@ -1036,6 +1084,45 @@ async def health_check():
         "active_sessions": connection_pool.active_count,
         "max_sessions": MAX_CONCURRENT_SESSIONS,
         "timestamp": int(time.time() * 1000),
+    })
+
+
+@app.get("/gpu-status")
+async def gpu_status():
+    """ROCm / MIGraphX verification endpoint."""
+    try:
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+    except ImportError:
+        providers = []
+
+    migraphx_available = "MIGraphXExecutionProvider" in providers
+    rocm_available = migraphx_available or "ROCMExecutionProvider" in providers
+
+    using_gpu = bool(analyzer and getattr(analyzer, "_use_onnx_gpu", False))
+    onnx_ep = None
+    if using_gpu:
+        onnx = getattr(analyzer, "_onnx", None)
+        if onnx is not None:
+            onnx_ep = "MIGraphX" if getattr(onnx, "using_migraphx", False) else "ROCM/CPU"
+
+    backend: str
+    if using_gpu:
+        backend = f"blazepose-onnx-{onnx_ep or 'gpu'}"
+    elif analyzer and getattr(analyzer, "_use_tasks", False):
+        backend = "mediapipe-tasks-cpu"
+    elif analyzer and analyzer.pose is not None:
+        backend = "mediapipe-legacy-cpu"
+    else:
+        backend = "unavailable"
+
+    return JSONResponse({
+        "rocm_available": rocm_available,
+        "migraphx_provider": migraphx_available,
+        "pose_backend": backend,
+        "onnx_execution_provider": onnx_ep,
+        "all_ort_providers": providers,
+        "analyzer_ready": analyzer is not None,
     })
 
 

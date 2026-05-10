@@ -36,6 +36,31 @@ except ImportError:  # pragma: no cover - optional dependency
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+import threading as _threading
+
+_ONNX_SINGLETON: object = None
+_ONNX_INIT_LOCK = _threading.Lock()
+
+
+def _get_onnx_pose():
+    """Return the module-level BlazePoseONNX singleton (created once, reused across requests)."""
+    global _ONNX_SINGLETON
+    if _ONNX_SINGLETON is not None:
+        return _ONNX_SINGLETON
+    with _ONNX_INIT_LOCK:
+        if _ONNX_SINGLETON is None:
+            try:
+                from pose_gpu import BlazePoseONNX
+                _ONNX_SINGLETON = BlazePoseONNX()
+                logger.info(
+                    "BlazePoseONNX singleton ready (MIGraphX=%s)",
+                    getattr(_ONNX_SINGLETON, "using_migraphx", False),
+                )
+            except Exception as _e:
+                logger.info("BlazePoseONNX unavailable: %s", _e)
+    return _ONNX_SINGLETON
+
+
 # ROCm-friendly default; override with MEDIAPIPE_DISABLE_GPU=1 for CPU-only.
 import os
 
@@ -47,7 +72,7 @@ _SHOULDER_IDXS = (11, 12)
 
 
 def _try_ffmpeg_browser_mp4(path: Path) -> None:
-    """Re-encode video to H.264 + yuv420p + faststart; keep AAC narration (do not strip audio)."""
+    """Remux to faststart for browser streaming; re-encode only if the stream copy fails."""
     if not shutil.which("ffmpeg"):
         logger.warning(
             "ffmpeg not on PATH — MP4 may use mpeg4 (mp4v) and not play in Chrome/Safari. "
@@ -58,36 +83,38 @@ def _try_ffmpeg_browser_mp4(path: Path) -> None:
     try:
         subprocess.run(
             [
-                "ffmpeg",
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                str(path),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", str(path),
+                "-c:v", "copy",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
                 str(tmp),
             ],
-            check=True,
-            capture_output=True,
-            timeout=7200,
+            check=True, capture_output=True, timeout=120,
         )
         tmp.replace(path)
         logger.info("ffmpeg: H.264 + faststart remux OK (browser-friendly)")
-    except Exception as exc:
-        logger.warning("ffmpeg remux failed (%s); keeping OpenCV output", exc)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", str(path),
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-c:a", "aac", "-b:a", "192k",
+                    str(tmp),
+                ],
+                check=True, capture_output=True, timeout=7200,
+            )
+            tmp.replace(path)
+            logger.info("ffmpeg: H.264 + faststart re-encode OK (browser-friendly)")
+        except Exception as exc:
+            logger.warning("ffmpeg remux failed (%s); keeping MoviePy output", exc)
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
@@ -346,7 +373,7 @@ def _heatmap_overlay_window(
     After ``phase_end`` we keep heat coloring for a short tail using follow-through ghost (t=1)
     so the clip does not snap to a flat blue outline right after the strike.
     """
-    post = max(24, int(1.35 * max(fps, 1.0)))
+    post = max(6, int(0.25 * max(fps, 1.0)))
     if frame_idx < phase_start:
         return False, 0.0
     if frame_idx <= phase_end:
@@ -921,6 +948,8 @@ def _apply_digital_zoom(
     z = float(max(1.0, zoom))
     if z <= 1.001:
         return frame
+    if not (np.isfinite(center_xy[0]) and np.isfinite(center_xy[1])):
+        return frame
     cx = float(np.clip(center_xy[0], 0, w - 1))
     cy = float(np.clip(center_xy[1], 0, h - 1))
     crop_w = max(2, int(round(w / z)))
@@ -1174,6 +1203,10 @@ def _map_point_after_digital_zoom(
     h: int,
 ) -> Tuple[int, int]:
     """Map a point from pre-zoom image coords to coords on the zoomed-and-resized canvas."""
+    if not (np.isfinite(center_xy[0]) and np.isfinite(center_xy[1])):
+        return int(np.clip(pt_xy[0], 0, w - 1)), int(np.clip(pt_xy[1], 0, h - 1))
+    if not (np.isfinite(pt_xy[0]) and np.isfinite(pt_xy[1])):
+        return w // 2, h // 2
     zf = float(max(1.0, zoom))
     cx = float(np.clip(center_xy[0], 0, w - 1))
     cy = float(np.clip(center_xy[1], 0, h - 1))
@@ -1220,13 +1253,14 @@ def _compose_commentary_frame_bgr(
 ) -> np.ndarray:
     """Single heatmap overlay frame (matches main encode heatmap + meter + label)."""
     out = frame_bgr.copy()
-    u_draw = seq[fi]
+    u_draw = smooth[fi]
     u_smooth = smooth[fi]
     v_row = vis[fi]
-    pts_user = np.zeros((33, 2), dtype=np.float64)
+    pts_user = np.full((33, 2), np.nan, dtype=np.float64)
     for lm in range(33):
-        pts_user[lm, 0] = u_draw[lm, 0] * w
-        pts_user[lm, 1] = u_draw[lm, 1] * h
+        if np.isfinite(u_draw[lm, 0]) and np.isfinite(u_draw[lm, 1]):
+            pts_user[lm, 0] = u_draw[lm, 0] * w
+            pts_user[lm, 1] = u_draw[lm, 1] * h
 
     heat_on, ghost_t = _heatmap_overlay_window(fi, phase_start, phase_end, fps)
     form_pct = 0.0
@@ -1519,8 +1553,6 @@ def _try_build_ai_cinematic_commentary_video(
 
     cap: Optional[cv2.VideoCapture] = None
     tmp_root = Path(tempfile.mkdtemp(prefix="ns_ai_cine_"))
-    seq_dir = tmp_root / "frames"
-    seq_dir.mkdir(parents=True, exist_ok=True)
     tts1_mp3 = tmp_root / "freeze1.mp3"
     tts2_mp3 = tmp_root / "freeze2.mp3"
     tts3_mp3 = tmp_root / "freeze3.mp3"
@@ -1602,13 +1634,10 @@ def _try_build_ai_cinematic_commentary_video(
             fps,
         )
 
-    idx = 0
+    rgb_frames: List[np.ndarray] = []
 
     def dump_rgb(rgb: np.ndarray) -> None:
-        nonlocal idx
-        p = seq_dir / f"{idx:06d}.png"
-        cv2.imwrite(str(p), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        idx += 1
+        rgb_frames.append(rgb)
 
     try:
         fb: Optional[np.ndarray] = None
@@ -1621,19 +1650,21 @@ def _try_build_ai_cinematic_commentary_video(
                 fb = bgr
         if fb is None:
             raise RuntimeError("missing backswing frame")
-        hip_mid = (
-            float(seq[B, 23, 0] + seq[B, 24, 0]) * 0.5 * w,
-            float(seq[B, 23, 1] + seq[B, 24, 1]) * 0.5 * h,
-        )
-        hip_circle = (
-            float(seq[B, kick_hip, 0] * w),
-            float(seq[B, kick_hip, 1] * h),
-        )
+        lh, rh = seq[B, 23], seq[B, 24]
+        if np.all(np.isfinite(lh)) and np.all(np.isfinite(rh)):
+            hip_mid = (float(lh[0] + rh[0]) * 0.5 * w, float(lh[1] + rh[1]) * 0.5 * h)
+        else:
+            hip_mid = (w / 2.0, h / 2.0)
+        kh = seq[B, kick_hip]
+        if np.all(np.isfinite(kh)):
+            hip_circle = (float(kh[0] * w), float(kh[1] * h))
+        else:
+            hip_circle = hip_mid
         fz1 = _freeze_zoom_circle_bgr(fb, hip_mid, 1.5, hip_circle, 28)
         n1 = max(1, int(round(freeze1_sec * fps)))
         rgb1 = cv2.cvtColor(fz1, cv2.COLOR_BGR2RGB)
         for _ in range(n1):
-            dump_rgb(rgb1.copy())
+            dump_rgb(rgb1)
 
         bgr_p2: Optional[np.ndarray] = None
         for fi in range(B, P2 + 1):
@@ -1644,22 +1675,30 @@ def _try_build_ai_cinematic_commentary_video(
                 bgr_p2 = bgr
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             for _ in range(slow_rep):
-                dump_rgb(rgb.copy())
+                dump_rgb(rgb)
 
         bi = bgr_p2
         if bi is None:
             raise RuntimeError("missing pre-contact frame")
-        instep_xy = (float(seq[P2, kick_ank, 0] * w), float(seq[P2, kick_ank, 1] * h))
-        torso_c = (
-            float(seq[P2, 11, 0] + seq[P2, 12, 0]) * 0.5 * w,
-            float(seq[P2, 11, 1] + seq[P2, 12, 1]) * 0.5 * h,
-        )
+        _ank = seq[P2, kick_ank]
+        if np.all(np.isfinite(_ank)):
+            instep_xy = (float(_ank[0] * w), float(_ank[1] * h))
+        else:
+            instep_xy = (w / 2.0, h / 2.0)
+        _s11, _s12 = seq[P2, 11], seq[P2, 12]
+        if np.all(np.isfinite(_s11)) and np.all(np.isfinite(_s12)):
+            torso_c = (
+                float(_s11[0] + _s12[0]) * 0.5 * w,
+                float(_s11[1] + _s12[1]) * 0.5 * h,
+            )
+        else:
+            torso_c = (w / 2.0, h / 2.0)
         zoom_c = (0.5 * (instep_xy[0] + torso_c[0]), 0.5 * (instep_xy[1] + torso_c[1]))
         fz2 = _freeze_zoom_circle_bgr(bi, zoom_c, 2.0, instep_xy, 30)
         n2 = max(1, int(round(freeze2_sec * fps)))
         rgb2 = cv2.cvtColor(fz2, cv2.COLOR_BGR2RGB)
         for _ in range(n2):
-            dump_rgb(rgb2.copy())
+            dump_rgb(rgb2)
 
         bgr_f: Optional[np.ndarray] = None
         for fi in range(P2, F + 1):
@@ -1670,17 +1709,21 @@ def _try_build_ai_cinematic_commentary_video(
                 bgr_f = bgr
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             for _ in range(slow_rep):
-                dump_rgb(rgb.copy())
+                dump_rgb(rgb)
 
         bf = bgr_f
         if bf is None:
             raise RuntimeError("missing follow-through frame")
-        knee_xy = (float(seq[F, kick_knee, 0] * w), float(seq[F, kick_knee, 1] * h))
+        _kn = seq[F, kick_knee]
+        if np.all(np.isfinite(_kn)):
+            knee_xy = (float(_kn[0] * w), float(_kn[1] * h))
+        else:
+            knee_xy = (w / 2.0, h / 2.0)
         fz3 = _freeze_zoom_circle_bgr(bf, knee_xy, 1.5, knee_xy, 26)
         n3 = max(1, int(round(freeze3_sec * fps)))
         rgb3 = cv2.cvtColor(fz3, cv2.COLOR_BGR2RGB)
         for _ in range(n3):
-            dump_rgb(rgb3.copy())
+            dump_rgb(rgb3)
 
         for fi in range(F + 1, T):
             bgr = read_composed_bgr(fi)
@@ -1688,23 +1731,24 @@ def _try_build_ai_cinematic_commentary_video(
                 continue
             dump_rgb(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
-        frame_files = sorted(
-            glob.glob(str(seq_dir / "*.png")),
-            key=lambda p: int(Path(p).stem),
-        )
-        if not frame_files:
+        if not rgb_frames:
             raise RuntimeError("no frames exported")
 
-        # MoviePy 2: keep with_mask=False so ffmpeg_writer never touches a half-built mask.
-        video_clip = ImageSequenceClip(frame_files, fps=float(fps), with_mask=False)
+        video_clip = ImageSequenceClip(rgb_frames, fps=float(fps), with_mask=False)
+
+        def silent_audio(dur: float, sr: int = 44100) -> Any:
+            n = max(1, int(round(max(0.0, dur) * sr)))
+            arr = np.zeros((n, 2), dtype=np.float32)
+            return AudioArrayClip(arr, fps=sr)
 
         def fit_audio(path: Path, dur: float) -> Any:
-            if not path.is_file():
-                sr = 44100
-                n = max(1, int(round(dur * sr)))
-                arr = np.zeros((n, 2), dtype=np.float32)
-                return AudioArrayClip(arr, fps=sr)
-            au = AudioFileClip(str(path))
+            if not path.is_file() or path.stat().st_size < 128:
+                return silent_audio(dur)
+            try:
+                au = AudioFileClip(str(path))
+            except Exception as exc:
+                logger.warning("Audio file %s could not be loaded (%s); using silence.", path.name, exc)
+                return silent_audio(dur)
             d = float(au.duration)
             if d > dur + 1e-3:
                 # Do not close ``au`` here — MoviePy 2 subclips can still delegate to the reader.
@@ -1728,24 +1772,12 @@ def _try_build_ai_cinematic_commentary_video(
         t3 = t2 + d_f2 + d_t2
         d_f3 = float(n3) / max(fps, 1e-3)
 
-        silent_intro = AudioArrayClip(
-            np.zeros((max(1, int(round(intro_dur * 44100))), 2), dtype=np.float32),
-            fps=44100,
-        )
-        silent_t1 = AudioArrayClip(
-            np.zeros((max(1, int(round(d_t1 * 44100))), 2), dtype=np.float32),
-            fps=44100,
-        )
-        silent_t2 = AudioArrayClip(
-            np.zeros((max(1, int(round(d_t2 * 44100))), 2), dtype=np.float32),
-            fps=44100,
-        )
+        silent_intro = silent_audio(intro_dur)
+        silent_t1 = silent_audio(d_t1)
+        silent_t2 = silent_audio(d_t2)
         outro_n = max(0, T - 1 - F)
         outro_dur = outro_n / max(fps, 1e-3)
-        silent_out = AudioArrayClip(
-            np.zeros((max(1, int(round(outro_dur * 44100))), 2), dtype=np.float32),
-            fps=44100,
-        )
+        silent_out = silent_audio(outro_dur)
 
         a_intro = _audio_at(silent_intro, 0.0)
         a_f1 = _audio_at(fit_audio(tts1_mp3, d_f1), t1)
@@ -1769,6 +1801,8 @@ def _try_build_ai_cinematic_commentary_video(
             remove_temp=True,
             fps=float(fps),
             logger=None,
+            preset="ultrafast",
+            threads=4,
         )
         final.close()
         video_clip.close()
@@ -2155,30 +2189,27 @@ def process_video(
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     logger.info("Input %s  %dx%d  %.2f fps  ~%d frames", input_path.name, w, h, fps, n_frames)
 
-    pose = mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=2,
-        smooth_landmarks=False,  # we apply Savitzky–Golay offline
-        min_detection_confidence=min_detection,
-        min_tracking_confidence=min_tracking,
-    )
+    pose_backend = os.environ.get("STRIKE_POSE_BACKEND", "mediapipe").strip().lower()
+    _gpu = _get_onnx_pose() if pose_backend == "onnx" else None
+    if _gpu is not None:
+        logger.info(
+            "Pose inference: BlazePose ONNX (MIGraphX=%s)",
+            getattr(_gpu, "using_migraphx", False),
+        )
+    else:
+        logger.info("Pose inference: MediaPipe tracker (accuracy mode)")
 
     raw_seq: List[np.ndarray] = []
     raw_vis: List[np.ndarray] = []
     raw_z: List[np.ndarray] = []
     frames_read = 0
 
-    while True:
-        ret, bgr = cap.read()
-        if not ret:
-            break
-        frames_read += 1
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        res = pose.process(rgb)
+    def _parse_result(res: object) -> None:
+        """Append one frame's landmarks (or NaN row) to raw_seq / raw_vis / raw_z."""
         xy = np.full((33, 2), np.nan, dtype=np.float64)
         z_row = np.full(33, np.nan, dtype=np.float64)
         v = np.zeros(33, dtype=np.float64)
-        if res.pose_landmarks:
+        if res.pose_landmarks:  # type: ignore[union-attr]
             for idx, lm in enumerate(res.pose_landmarks.landmark):
                 if idx >= 33:
                     break
@@ -2190,8 +2221,38 @@ def process_video(
         raw_vis.append(v)
         raw_z.append(z_row)
 
-    cap.release()
-    pose.close()
+    if _gpu is not None:
+        # GPU path: read all frames into memory, run batch inference.
+        # Detector + landmark on MI300X ≈ 10-15 ms/frame vs ~100 ms on CPU.
+        all_rgb: List[np.ndarray] = []
+        while True:
+            ret, bgr = cap.read()
+            if not ret:
+                break
+            frames_read += 1
+            all_rgb.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        cap.release()
+
+        for res in _gpu.estimate_batch(all_rgb):  # type: ignore[union-attr]
+            _parse_result(res)
+    else:
+        # CPU fallback: original MediaPipe per-frame loop (unchanged logic).
+        pose = mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=2,
+            smooth_landmarks=False,
+            min_detection_confidence=min_detection,
+            min_tracking_confidence=min_tracking,
+        )
+        while True:
+            ret, bgr = cap.read()
+            if not ret:
+                break
+            frames_read += 1
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            _parse_result(pose.process(rgb))
+        cap.release()
+        pose.close()
 
     if frames_read == 0:
         raise RuntimeError("No frames read from video.")
@@ -2271,12 +2332,12 @@ def process_video(
 
         out = frame.copy()
         u_smooth = smooth[fi]
-        u_raw = seq[fi]
         v_row = vis[fi]
-        pts_user = np.zeros((33, 2), dtype=np.float64)
+        pts_user = np.full((33, 2), np.nan, dtype=np.float64)
         for lm in range(33):
-            pts_user[lm, 0] = u_raw[lm, 0] * w
-            pts_user[lm, 1] = u_raw[lm, 1] * h
+            if np.isfinite(u_smooth[lm, 0]) and np.isfinite(u_smooth[lm, 1]):
+                pts_user[lm, 0] = u_smooth[lm, 0] * w
+                pts_user[lm, 1] = u_smooth[lm, 1] * h
 
         # Draw only one skeleton layer (heatmap) to avoid duplicate visual outlines.
         pts_ideal = pts_user.copy()

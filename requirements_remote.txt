@@ -18,3 +18,10 @@ numpy<2.0.0  # mediapipe requires numpy<2.0.0
 
 # Utilities
 python-multipart==0.0.6
+
+# GPU inference — BlazePose ONNX on AMD MI300X via ROCm + MIGraphX
+# On the droplet, install the ROCm-enabled wheel instead of the plain one:
+#   pip install onnxruntime-rocm \
+#     --extra-index-url https://repo.radeon.com/rocm/manylinux/rocm-rel-6.2/
+# The plain package below provides CPU fallback on machines without ROCm.
+onnxruntime>=1.18.0

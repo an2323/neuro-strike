@@ -199,7 +199,29 @@ def serve_result(filename: str):
     return send_file(path, mimetype=mimetype, as_attachment=False, download_name=safe, conditional=True)
 
 
+def _prewarm_onnx():
+    """Background thread: initialise BlazePoseONNX singleton + MIGraphX JIT at startup."""
+    if os.environ.get("STRIKE_POSE_BACKEND", "mediapipe").strip().lower() != "onnx":
+        logger.info("BlazePoseONNX pre-warm skipped (STRIKE_POSE_BACKEND=mediapipe)")
+        return
+    try:
+        from strike_video_processor import _get_onnx_pose
+        bp = _get_onnx_pose()
+        if bp is not None:
+            import numpy as np
+            bp.process(np.zeros((360, 640, 3), dtype=np.uint8))
+            logger.info(
+                "BlazePoseONNX pre-warmed (MIGraphX=%s)",
+                getattr(bp, "using_migraphx", False),
+            )
+    except Exception:
+        logger.debug("BlazePoseONNX pre-warm skipped", exc_info=True)
+
+
 if __name__ == "__main__":
+    import threading
+    threading.Thread(target=_prewarm_onnx, daemon=True).start()
+
     host = os.environ.get("STRIKE_LAB_HOST", "0.0.0.0")
     port = int(os.environ.get("STRIKE_LAB_PORT", "5050"))
     if os.environ.get("STRIKE_LAB_DEV", "").lower() in ("1", "true", "yes"):
