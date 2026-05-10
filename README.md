@@ -1,6 +1,39 @@
-# NeuroStrike
+# StrikeLab
 
-**NeuroStrike** is a football strike biomechanics stack: pose estimation on strike footage, ghost / heatmap-style overlays, coaching metrics, and an optional **narrated cinematic analysis** export. It is built for **AMD ROCm** and **Instinct MI300-class** accelerators (MediaPipe GPU enabled by default on the remote path).
+**StrikeLab** is a football strike biomechanics stack: pose estimation on strike footage, ghost / heatmap-style overlays, coaching metrics, and an optional **narrated cinematic analysis** export.
+
+The project is optimized for **AMD ROCm on MI300X**. The accelerated path uses **ONNX Runtime**, **MIGraphXExecutionProvider**, ROCm / hipBLAS compatibility shims where needed, OpenCV, MoviePy, ffmpeg, and a MediaPipe-based accuracy mode for more stable multi-player footage.
+
+## ROCm Performance Summary
+
+| Version | Backend | End-to-end time | Notes |
+|---------|---------|-----------------|-------|
+| Original CPU path | CPU MediaPipe | ~80s | User-observed before ROCm work |
+| Current accuracy mode | MediaPipe tracker + optimized renderer | 16.09s | More stable skeleton / heatmap for multi-player footage |
+
+Measured speedups:
+
+- **Current accuracy mode:** `80s -> 16.09s`, about **5.0x faster**, while prioritizing tracking stability.
+
+Latest stable run breakdown:
+
+| Phase | Time |
+|-------|------|
+| Upload / file handling | ~1.0s |
+| Pose tracking + biomechanical preprocessing | ~7.7s |
+| Storyboard / overlay preparation | ~0.6s |
+| MoviePy cinematic render / export | ~6.5s |
+| FFmpeg browser remux | ~0.1s |
+
+Optimization steps applied:
+
+1. Moved neural inference from CPU MediaPipe to **ROCm + ONNX Runtime + MIGraphX** on MI300X.
+2. Preserved 33-landmark biomechanics by using BlazePose-compatible ONNX models instead of lower-keypoint pose models.
+3. Added GPU fallback safety so the app can fall back to CPU / tracker paths when ROCm is unavailable.
+4. Hardened NaN handling in cinematic overlays for frames with missing pose detections.
+5. Optimized the render path so GPU acceleration moved the workload from minute-scale to seconds-scale.
+
+Versus CPU, the current measured speedup is **~5.0x** while preserving stable tracking. We did not benchmark NVIDIA directly; the result shows this workload can run on an open **AMD ROCm + MI300X + ONNX Runtime + MIGraphX** stack instead of requiring CUDA.
 
 The repo contains **three runnable surfaces** that share the same biomechanical ideas but target different workflows:
 
@@ -16,7 +49,7 @@ The repo contains **three runnable surfaces** that share the same biomechanical 
 ## What Strike Lab does
 
 1. **Ingest** a short strike clip (MP4 or MOV).
-2. **Estimate pose** with **MediaPipe Pose** at **model complexity 2** (33 landmarks).
+2. **Estimate pose** with **MediaPipe Pose** at **model complexity 2** or BlazePose-compatible ONNX on ROCm / MIGraphX (33 landmarks).
 3. **Smooth** trajectories (Savitzky–Golay where SciPy is available).
 4. **Detect** strike phase, kicking leg, and biomechanical signals (e.g. ankle speed, joint angles, form match vs a corrected “ghost” template).
 5. **Produce**:
@@ -32,7 +65,9 @@ Processing expects **Linux + Python 3.10+** and a sane **ffmpeg/ffprobe** on `PA
 
 - **Python 3** — NumPy, SciPy (temporal smoothing).
 - **OpenCV** (`opencv-python-headless`) — decode/encode, overlays.
-- **MediaPipe** — BlazePose / Pose, GPU-friendly on ROCm when `MEDIAPIPE_DISABLE_GPU=0`.
+- **AMD ROCm + MI300X** — GPU acceleration target.
+- **ONNX Runtime + MIGraphXExecutionProvider** — accelerated BlazePose-compatible inference path.
+- **MediaPipe** — BlazePose / Pose tracker and accuracy fallback at model complexity 2.
 - **Flask** + **Waitress** — Strike Lab HTTP server.
 - **FastAPI** + **Uvicorn** — `remote_main.py` / `main.py`.
 - **MoviePy** + **gTTS** — narrated export (optional deps are listed in `requirements.txt` comments).
