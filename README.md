@@ -39,22 +39,50 @@ Versus CPU, the current measured speedup is **~5.0x** while preserving stable tr
 
 ## Strike Lab Pipeline
 
+Two views of the same run: **(1) orchestration** from browser upload through artefacts, and **(2) cinematic manipulations** — what happens to pixels and audio when building the narrated MP4.
+
+### 1. Orchestration (upload → analysis → deliverables)
+
 ```mermaid
 flowchart TD
     A[Browser uploads MP4 / MOV] --> B[Strike Lab web app<br/>Flask + Waitress]
     B --> C[Save upload<br/>uploads/]
     C --> D[strike_video_processor.process_video]
     D --> E[Decode frames<br/>OpenCV]
-    E --> F[Pose tracking<br/>MediaPipe accuracy mode<br/>or ONNX ROCm path]
-    F --> G[Biomechanics preprocessing<br/>smoothing + valid-frame handling]
+    E --> F[Pose tracking<br/>MediaPipe accuracy mode<br/>or ONNX + ROCm / MIGraphX]
+    F --> G[Biomechanics preprocessing<br/>smoothing + valid-frame / NaN handling]
     G --> H[Three-phase kick analysis<br/>backswing, contact, follow-through]
     H --> I[Coaching feedback<br/>strengths, weaknesses, drills]
-    I --> J[gTTS narration<br/>based on feedback]
-    H --> K[Overlay + cinematic render<br/>pauses, zooms, heatmap/ghost]
-    J --> K
-    K --> L[MoviePy export]
-    L --> M[FFmpeg remux<br/>browser-ready MP4]
+    I --> J[gTTS narration<br/>from coaching text]
+    H --> K[Storyboard + overlay prep<br/>phase PNG, skeleton layers]
+    J --> L[Cinematic compose + render<br/>MoviePy timeline]
+    K --> L
+    L --> M[FFmpeg remux<br/>browser-ready H.264 + AAC]
     M --> N[Browser response<br/>MP4 + storyboard PNG + JSON]
+```
+
+### 2. Cinematic track (manipulations)
+
+What the exporter applies on top of landmarks, phase splits, and coaching copy:
+
+```mermaid
+flowchart TD
+    subgraph inputs["Inputs from analysis"]
+        L33[Per-frame 33 landmarks + visibility]
+        PH[Phase boundaries + form metrics]
+        TXT[Coaching script strings]
+    end
+    TXT --> TTS[Text-to-speech — gTTS<br/>voice-over timeline]
+    L33 --> OV[Overlay stack<br/>skeleton, heatmap / ghost]
+    PH --> OV
+    OV --> ZM[Digital zoom / crop<br/>follow kicking leg & joints]
+    OV --> PS[Edit pacing<br/>holds, pauses, speed ramps]
+    ZM --> COMP[Composite video frames]
+    PS --> COMP
+    TTS --> MUX[Align audio + video]
+    COMP --> MUX
+    MUX --> MP[MoviePy export encode]
+    MP --> FF[FFmpeg remux<br/>stream-friendly MP4]
 ```
 
 The repo contains **three runnable surfaces** that share the same biomechanical ideas but target different workflows:
