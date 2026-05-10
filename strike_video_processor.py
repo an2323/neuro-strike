@@ -3,11 +3,11 @@
 NeuroStrike — offline football strike video post-processor.
 
 Input: path to a video file (any format OpenCV can decode).
-Output: annotated MP4 with MediaPipe pose, Savitzky–Golay smoothing, a Dynamic
-Adaptive Coach ghost (biomechanically corrected per frame), error vectors, power meter, form-match %.
+Output: annotated MP4 with MediaPipe pose, Savitzky–Golay smoothing, and a
+single-skeleton biomechanical heatmap (blue->red error gradient), plus power meter and form-match %.
 
 Usage:
-  python strike_video_processor.py --input kick.mp4 --output kick_ghost.mp4
+  python strike_video_processor.py --input kick.mp4 --output kick_heatmap.mp4
 
 Optional: pip install -r requirements_strike_video.txt (adds scipy for Savitzky–Golay).
 """
@@ -90,6 +90,7 @@ def _try_ffmpeg_browser_mp4(path: Path) -> None:
 POWER_METER_REF_SPEED = 900.0
 # Mean normalized joint error below this maps toward 100% form match
 FORM_MATCH_SCALE = 0.12
+JOINT_ERROR_MAX_DEG = 30.0
 # Joints used for form match (core + kicking chain); indices are BlazePose order
 FORM_MATCH_LM_INDICES = (
     0,
@@ -109,6 +110,34 @@ FORM_MATCH_LM_INDICES = (
     30,
     31,
     32,
+)
+
+MAIN_JOINT_TRIPLETS: Dict[int, Tuple[int, int, int]] = {
+    # shoulder: elbow-shoulder-hip
+    11: (13, 11, 23),
+    12: (14, 12, 24),
+    # hip: shoulder-hip-knee
+    23: (11, 23, 25),
+    24: (12, 24, 26),
+    # knee: hip-knee-ankle
+    25: (23, 25, 27),
+    26: (24, 26, 28),
+    # ankle: knee-ankle-foot
+    27: (25, 27, 31),
+    28: (26, 28, 32),
+}
+
+HEATMAP_BONES: Tuple[Tuple[int, int], ...] = (
+    (11, 12),
+    (11, 23),
+    (12, 24),
+    (23, 24),
+    (23, 25),
+    (25, 27),
+    (27, 31),
+    (24, 26),
+    (26, 28),
+    (28, 32),
 )
 
 
@@ -276,18 +305,12 @@ _LEFT_LEG  = {"hip": 23, "knee": 25, "ankle": 27, "heel": 29, "foot": 31}
 _RIGHT_LEG = {"hip": 24, "knee": 26, "ankle": 28, "heel": 30, "foot": 32}
 
 # ─── Biomechanical correction targets ────────────────────────────────────────
-_LEAN_TARGET_DEG  = 7.5   # ideal forward torso lean from vertical (degrees)
-_WINDUP_EXTRA_DEG = 20.0  # extra knee bend added during wind-up phase
-_IMPACT_EXT_DEG   = 168.0 # target knee angle at impact (near-straight)
-
-
-def _joint_angle_deg(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    """Angle in degrees at vertex b, formed by the a-b-c chain."""
-    ba, bc = a - b, c - b
-    la, lc = np.linalg.norm(ba), np.linalg.norm(bc)
-    if la < 1e-6 or lc < 1e-6:
-        return 180.0
-    return float(np.degrees(np.arccos(np.clip(np.dot(ba, bc) / (la * lc), -1.0, 1.0))))
+_LEAN_BAND_LO_DEG = 5.0
+_LEAN_BAND_HI_DEG = 10.0
+_LEAN_TARGET_DEG = 7.5  # within band above (degrees forward from vertical in image coords)
+_IMPACT_INTERIOR_DEG = 172.0  # hip-knee-ankle interior angle at ball contact (almost straight)
+# Wind-up: extra knee flex vs a neutral instep template (see _ideal_kicking_knee_interior_deg)
+_WINDUP_EXTRA_DEG = 20.0
 
 
 def _set_joint_angle(
@@ -317,6 +340,62 @@ def _set_joint_angle(
     return middle + l2 * new_v2_unit
 
 
+def _snap_leg_interior(
+    g: np.ndarray,
+    hip_i: int,
+    knee_i: int,
+    ankle_i: int,
+    heel_i: int,
+    foot_i: int,
+    target_interior_deg: float,
+) -> None:
+    """Force hip-knee-ankle interior angle; move ankle/foot/heel by translation (bone lengths preserved)."""
+    if (
+        hip_i >= g.shape[0]
+        or knee_i >= g.shape[0]
+        or ankle_i >= g.shape[0]
+        or not np.all(np.isfinite(g[hip_i]))
+        or not np.all(np.isfinite(g[knee_i]))
+        or not np.all(np.isfinite(g[ankle_i]))
+    ):
+        return
+    new_ankle = _set_joint_angle(g[hip_i], g[knee_i], g[ankle_i], float(target_interior_deg))
+    shift = new_ankle - g[ankle_i]
+    g[ankle_i] += shift
+    for idx in (heel_i, foot_i):
+        if idx < g.shape[0] and np.all(np.isfinite(g[idx])):
+            g[idx] += shift
+
+
+def _ideal_base_knee_interior_deg(phase_t: float) -> float:
+    """
+    Template instep kinematic (interior hip-knee-ankle angle vs strike phase).
+
+    Sharp wind-up tucked knee near mid-wind-up, near-full extension centered on impact,
+    softer follow-through. Values chosen so the silhouette reads as textbook form.
+    """
+    t_breaks = np.array([0.0, 0.16, 0.28, 0.36, 0.44, 0.52, 0.62, 0.82, 1.0], dtype=np.float64)
+    ideals = np.array([118.0, 98.0, 78.0, 64.0, 108.0, 176.0, 170.0, 136.0, 124.0], dtype=np.float64)
+    return float(np.interp(float(np.clip(phase_t, 0.0, 1.0)), t_breaks, ideals))
+
+
+def _ideal_kicking_knee_interior_deg(phase_t: float) -> float:
+    """
+    User rule: backswing shows ~20° extra knee flex vs neutral template (more power pocket).
+    """
+    base = _ideal_base_knee_interior_deg(phase_t)
+    wind = float(np.clip(1.0 - phase_t / 0.38, 0.0, 1.0))
+    # Smaller interior angle = deeper knee bend
+    return float(max(28.0, base - _WINDUP_EXTRA_DEG * wind))
+
+
+def _ideal_support_knee_interior_deg(phase_t: float) -> float:
+    """Plant leg: stable, slightly flexed — contrast with kicking leg."""
+    t_breaks = np.array([0.0, 0.35, 0.50, 0.68, 1.0], dtype=np.float64)
+    ideals = np.array([158.0, 155.0, 166.0, 162.0, 160.0], dtype=np.float64)
+    return float(np.interp(float(np.clip(phase_t, 0.0, 1.0)), t_breaks, ideals))
+
+
 def _detect_kicking_leg(smooth: np.ndarray, vis: np.ndarray, peak_idx: int) -> str:
     """Identify the kicking leg by comparing ankle displacement near the peak frame."""
     lo = max(0, peak_idx - 4)
@@ -339,73 +418,71 @@ def _generate_corrected_ghost(
     kicking_side: str,
 ) -> np.ndarray:
     """
-    Build a per-frame 'ideal form' skeleton from the user's own coordinates.
+    Build a per-frame ideal instep coach pose anchored on the athlete.
 
-    All corrections operate in the same normalised image space as user_xy, so
-    the ghost is automatically matched in position and scale to the athlete.
+    Hips / bone lengths follow the user in normalised image space; articulation
+    is driven by phase so the golden skeleton shows textbook wind-up, extension,
+    and follow-through instead of mirroring noisy input.
 
-    phase_t: 0.0 = wind-up start, 0.5 = peak impact, 1.0 = follow-through end.
-    kicking_side: "LEFT" or "RIGHT".
+      Rule 1 – Lean:  torso forward tilt clamped into the coach band (~5°–10°).
+      Rule 2 – Wind-up: +20° extra knee fold vs the neutral kinematic curve.
+      Rule 3 – Impact: kicking leg snaps toward nearly straight (~172° interior).
+      Support leg is held in a stable, slightly flexed plant shape for contrast.
 
-    Three biomechanical rules are applied:
-      Rule 1 – Lean:      torso tilted 7.5 degrees forward from vertical.
-      Rule 2 – Wind-up:   kicking knee bent 20° extra during approach.
-      Rule 3 – Extension: kicking leg nearly straight (168°) at impact.
+    ``user_vis`` is reserved for future gating but does not limit ghost geometry.
     """
+    _ = user_vis  # symmetry with callers; limb snaps use finite landmarks only
+
     g = user_xy.copy()
-    leg = _RIGHT_LEG if kicking_side == "RIGHT" else _LEFT_LEG
+    kick = _RIGHT_LEG if kicking_side == "RIGHT" else _LEFT_LEG
+    plant = _LEFT_LEG if kicking_side == "RIGHT" else _RIGHT_LEG
 
-    def ok(*idxs: int) -> bool:
-        return all(np.all(np.isfinite(g[i])) for i in idxs)
-
-    # ── Rule 1: Torso forward lean ────────────────────────────────────────────
-    if ok(11, 12, 23, 24):
+    # ── Rule 1: Torso forward lean (fixed coach band), not athlete-specific lean ─
+    if np.all(np.isfinite(g[11])) and np.all(np.isfinite(g[12])):
         mid_hip = (g[23] + g[24]) * 0.5
-        mid_sh  = (g[11] + g[12]) * 0.5
-        torso   = mid_sh - mid_hip
-        t_len   = float(np.linalg.norm(torso))
+        mid_sh = (g[11] + g[12]) * 0.5
+        torso = mid_sh - mid_hip
+        t_len = float(np.linalg.norm(torso))
         if t_len > 1e-4:
-            # current lean from vertical (image y increases downward, so up = -y)
             curr_lean = float(np.degrees(np.arctan2(torso[0], -torso[1])))
-            # forward direction = same horizontal sign as current torso lean
-            fwd = float(np.sign(curr_lean)) if abs(curr_lean) > 0.5 else 1.0
-            tgt_rad   = np.radians(fwd * _LEAN_TARGET_DEG)
+            if abs(curr_lean) < 2.0:
+                fwd = 1.0 if kicking_side == "RIGHT" else -1.0
+            else:
+                fwd = float(np.sign(curr_lean)) if abs(curr_lean) > 0.5 else 1.0
+            lean_mag = float(np.clip(_LEAN_TARGET_DEG, _LEAN_BAND_LO_DEG, _LEAN_BAND_HI_DEG))
+            tgt_rad = np.radians(fwd * lean_mag)
             new_torso = t_len * np.array([np.sin(tgt_rad), -np.cos(tgt_rad)])
-            sh_shift  = new_torso - torso
-            # Shift head, neck, shoulders and arms together
-            for idx in range(17):        # landmarks 0-16: face + shoulders + arms
+            sh_shift = new_torso - torso
+            for idx in range(17):  # head + arms rigid with shoulders
                 if np.all(np.isfinite(g[idx])):
                     g[idx] = g[idx] + sh_shift
 
-    k_hip   = leg["hip"]
-    k_knee  = leg["knee"]
-    k_ankle = leg["ankle"]
-    k_heel  = leg["heel"]
-    k_foot  = leg["foot"]
+    pt = float(np.clip(phase_t, 0.0, 1.0))
 
-    # ── Rule 2: Wind-up – deeper knee bend on the kicking leg ────────────────
-    wind_w = float(np.clip(1.0 - phase_t / 0.35, 0.0, 1.0))
-    if wind_w > 0.05 and ok(k_hip, k_knee, k_ankle):
-        curr = _joint_angle_deg(g[k_hip], g[k_knee], g[k_ankle])
-        tgt  = max(25.0, curr - _WINDUP_EXTRA_DEG * wind_w)
-        if curr - tgt > 1.0:
-            new_ankle = _set_joint_angle(g[k_hip], g[k_knee], g[k_ankle], tgt)
-            shift = new_ankle - g[k_ankle]
-            g[k_ankle] = g[k_ankle] + shift
-            if ok(k_heel): g[k_heel] = g[k_heel] + shift
-            if ok(k_foot): g[k_foot] = g[k_foot] + shift
+    # ── Rule 2 + 3: Phase-native kicking leg kinematics (+ wind-up sharpening) ─
+    kick_ideal = _ideal_kicking_knee_interior_deg(pt)
+    impact_gate = float(np.clip(1.0 - abs(pt - 0.5) / 0.12, 0.0, 1.0))
+    kick_ideal = kick_ideal * (1.0 - impact_gate) + _IMPACT_INTERIOR_DEG * impact_gate
 
-    # ── Rule 3: Impact – near-straight kicking leg ───────────────────────────
-    ext_w = float(np.clip(1.0 - abs(phase_t - 0.5) / 0.30, 0.0, 1.0))
-    if ext_w > 0.05 and ok(k_hip, k_knee, k_ankle):
-        curr = _joint_angle_deg(g[k_hip], g[k_knee], g[k_ankle])
-        tgt  = 155.0 + (_IMPACT_EXT_DEG - 155.0) * ext_w   # ramp up to 168°
-        if tgt - curr > 1.0:
-            new_ankle = _set_joint_angle(g[k_hip], g[k_knee], g[k_ankle], tgt)
-            shift = new_ankle - g[k_ankle]
-            g[k_ankle] = g[k_ankle] + shift
-            if ok(k_heel): g[k_heel] = g[k_heel] + shift
-            if ok(k_foot): g[k_foot] = g[k_foot] + shift
+    _snap_leg_interior(
+        g,
+        kick["hip"],
+        kick["knee"],
+        kick["ankle"],
+        kick["heel"],
+        kick["foot"],
+        kick_ideal,
+    )
+
+    _snap_leg_interior(
+        g,
+        plant["hip"],
+        plant["knee"],
+        plant["ankle"],
+        plant["heel"],
+        plant["foot"],
+        _ideal_support_knee_interior_deg(pt),
+    )
 
     return g
 
@@ -430,6 +507,117 @@ def _form_match_percent(
     # 0 error -> 100%, mean_e >= scale -> ~0%
     score = 100.0 * max(0.0, 1.0 - mean_e / FORM_MATCH_SCALE)
     return float(np.clip(score, 0.0, 100.0))
+
+
+def _joint_angle_deg(pts: np.ndarray, a: int, b: int, c: int) -> Optional[float]:
+    if not (_finite_pt(pts, a) and _finite_pt(pts, b) and _finite_pt(pts, c)):
+        return None
+    ba = pts[a] - pts[b]
+    bc = pts[c] - pts[b]
+    la = float(np.linalg.norm(ba))
+    lc = float(np.linalg.norm(bc))
+    if la < 1e-6 or lc < 1e-6:
+        return None
+    ang = float(np.degrees(np.arccos(np.clip(np.dot(ba, bc) / (la * lc), -1.0, 1.0))))
+    return ang
+
+
+def _angle_abs_diff_deg(a1: float, a2: float) -> float:
+    d = abs(float(a1) - float(a2)) % 360.0
+    return min(d, 360.0 - d)
+
+
+def _error_deg_to_bgr(err_deg: float) -> Tuple[int, int, int]:
+    # 0 deg -> blue, JOINT_ERROR_MAX_DEG -> red.
+    t = float(np.clip(err_deg / JOINT_ERROR_MAX_DEG, 0.0, 1.0))
+    hue = (1.0 - t) * 240.0  # blue(240) -> red(0)
+    h_cv = int(np.clip(hue / 2.0, 0, 179))
+    hls = np.uint8([[[h_cv, 140, 255]]])  # bright, high saturation
+    bgr = cv2.cvtColor(hls, cv2.COLOR_HLS2BGR)[0, 0]
+    return int(bgr[0]), int(bgr[1]), int(bgr[2])
+
+
+def _draw_gradient_bone(
+    img: np.ndarray,
+    p1: Tuple[int, int],
+    p2: Tuple[int, int],
+    c1: Tuple[int, int, int],
+    c2: Tuple[int, int, int],
+    thickness: int = 4,
+) -> None:
+    d = np.array([p2[0] - p1[0], p2[1] - p1[1]], dtype=np.float64)
+    dist = float(np.linalg.norm(d))
+    if dist < 1e-6:
+        return
+    segments = max(8, int(dist / 10.0))
+    for i in range(segments):
+        t0 = i / segments
+        t1 = (i + 1) / segments
+        q0 = (int(round(p1[0] + d[0] * t0)), int(round(p1[1] + d[1] * t0)))
+        q1 = (int(round(p1[0] + d[0] * t1)), int(round(p1[1] + d[1] * t1)))
+        tc = (t0 + t1) * 0.5
+        col = (
+            int(round(c1[0] * (1.0 - tc) + c2[0] * tc)),
+            int(round(c1[1] * (1.0 - tc) + c2[1] * tc)),
+            int(round(c1[2] * (1.0 - tc) + c2[2] * tc)),
+        )
+        cv2.line(img, q0, q1, col, thickness, cv2.LINE_AA)
+
+
+def _joint_error_map_deg(user_pts: np.ndarray, ideal_pts: np.ndarray) -> Dict[int, float]:
+    out: Dict[int, float] = {}
+    for j, (a, b, c) in MAIN_JOINT_TRIPLETS.items():
+        ua = _joint_angle_deg(user_pts, a, b, c)
+        ia = _joint_angle_deg(ideal_pts, a, b, c)
+        if ua is None or ia is None:
+            continue
+        out[j] = _angle_abs_diff_deg(ua, ia)
+    return out
+
+
+def _form_match_from_joint_errors(joint_errors: Dict[int, float]) -> float:
+    if not joint_errors:
+        return 0.0
+    vals = [float(np.clip(v, 0.0, JOINT_ERROR_MAX_DEG)) for v in joint_errors.values()]
+    mean_v = float(np.mean(vals))
+    return float(np.clip(100.0 * (1.0 - mean_v / JOINT_ERROR_MAX_DEG), 0.0, 100.0))
+
+
+def _draw_heatmap_skeleton(
+    img: np.ndarray,
+    pts_user: np.ndarray,
+    joint_errors: Dict[int, float],
+    kicking_side: str,
+) -> None:
+    neutral = (235, 120, 20)  # default blue-ish when no angle available
+    joint_colors: Dict[int, Tuple[int, int, int]] = {}
+    for j in MAIN_JOINT_TRIPLETS:
+        e = joint_errors.get(j, 0.0)
+        joint_colors[j] = _error_deg_to_bgr(e)
+
+    # Optional emphasis: kicking-side leg gets slight brightness bump for readability.
+    kick_idxs = (24, 26, 28) if kicking_side == "RIGHT" else (23, 25, 27)
+    for j in kick_idxs:
+        if j in joint_colors:
+            b, g, r = joint_colors[j]
+            joint_colors[j] = (min(255, b + 10), min(255, g + 10), min(255, r + 10))
+
+    for a, b in HEATMAP_BONES:
+        if not _finite_pt(pts_user, a) or not _finite_pt(pts_user, b):
+            continue
+        if abs(pts_user[a, 0]) + abs(pts_user[a, 1]) < 3 or abs(pts_user[b, 0]) + abs(pts_user[b, 1]) < 3:
+            continue
+        pa = (int(round(pts_user[a, 0])), int(round(pts_user[a, 1])))
+        pb = (int(round(pts_user[b, 0])), int(round(pts_user[b, 1])))
+        ca = joint_colors.get(a, neutral)
+        cb = joint_colors.get(b, neutral)
+        _draw_gradient_bone(img, pa, pb, ca, cb, thickness=4)
+
+    for j, col in joint_colors.items():
+        if not _finite_pt(pts_user, j):
+            continue
+        x, y = int(round(pts_user[j, 0])), int(round(pts_user[j, 1]))
+        cv2.circle(img, (x, y), 5, col, -1, cv2.LINE_AA)
 
 
 def _draw_dashed_line(
@@ -657,9 +845,7 @@ def process_video(
         raise RuntimeError("Could not open VideoWriter with mp4v or avc1.")
 
     fi = 0
-    neon_blue = (255, 128, 0)  # BGR vivid blue
-    gold = (0, 200, 255)  # BGR gold
-    error_color = (60, 60, 255)  # red-ish
+    base_skel_color = (190, 90, 30)  # dim blue base under heatmap
 
     while True:
         ret, frame = cap.read()
@@ -676,59 +862,52 @@ def process_video(
             pts_user[lm, 0] = u_norm[lm, 0] * w
             pts_user[lm, 1] = u_norm[lm, 1] * h
 
-        # User skeleton (neon blue)
-        _draw_skeleton_lines(out, pts_user, connections, neon_blue, 3)
-        _draw_skeleton_points(out, pts_user, neon_blue, 4)
+        # Base user skeleton (dim) + phase heatmap overlay
+        _draw_skeleton_lines(out, pts_user, connections, base_skel_color, 2)
+        _draw_skeleton_points(out, pts_user, base_skel_color, 3)
 
         in_phase = _in_strike_phase(fi, phase_start, phase_end)
         form_pct = 0.0
         if in_phase:
             pt = _phase_t(fi, phase_start, phase_end)
-            g_norm = _generate_corrected_ghost(u_norm, v_row, pt, kicking_side)
-            pts_ghost = np.zeros((33, 2), dtype=np.float64)
+            ideal_norm = _generate_corrected_ghost(u_norm, v_row, pt, kicking_side)
+            pts_ideal = np.zeros((33, 2), dtype=np.float64)
             for lm in range(33):
-                pts_ghost[lm, 0] = g_norm[lm, 0] * w
-                pts_ghost[lm, 1] = g_norm[lm, 1] * h
+                pts_ideal[lm, 0] = ideal_norm[lm, 0] * w
+                pts_ideal[lm, 1] = ideal_norm[lm, 1] * h
 
-            ghost_layer = np.zeros_like(out)
-            _draw_skeleton_lines(ghost_layer, pts_ghost, connections, gold, 3)
-            _draw_skeleton_points(ghost_layer, pts_ghost, gold, 4)
-            out = _blend_color_layer(out, ghost_layer, 0.55)
-
-            # Error vectors: from user joint to corrected-ideal joint (dashed red)
-            for lm in FORM_MATCH_LM_INDICES:
-                if v_row[lm] < 0.2:
-                    continue
-                if not _finite_pt(pts_user, lm) or not _finite_pt(pts_ghost, lm):
-                    continue
-                if _is_cornerish_norm(u_norm[lm]) or _is_cornerish_norm(g_norm[lm]):
-                    continue
-                p_u = (int(round(pts_user[lm, 0])), int(round(pts_user[lm, 1])))
-                p_g = (int(round(pts_ghost[lm, 0])), int(round(pts_ghost[lm, 1])))
-                _draw_dashed_line(out, p_u, p_g, error_color, 1, 6, 5)
-
-            form_pct = _form_match_percent(u_norm, g_norm, v_row)
+            joint_errors = _joint_error_map_deg(pts_user, pts_ideal)
+            _draw_heatmap_skeleton(out, pts_user, joint_errors, kicking_side)
+            form_pct = _form_match_from_joint_errors(joint_errors)
 
         # Power meter from normalized speed → px/s equivalent for display
         speed_px_equiv = speeds_norm[fi] * float(np.hypot(w, h))
         fill = min(1.0, speed_px_equiv / POWER_METER_REF_SPEED)
         _draw_power_meter(out, fill)
 
-        # Form match text
-        label = f"Form Match: {form_pct:.1f}%"
+        # Small label near the kicking leg with angle-error-based form score.
+        lbl = f"Form Match {form_pct:.0f}%"
         if not in_phase:
-            label = "Form Match: -- (outside strike phase)"
-        tw, th = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)[0]
-        bx0, bx1 = 8, 8 + tw + 16
-        by0, by1 = h - th - 28, h - 8
-        cv2.rectangle(out, (bx0, by0), (bx1, by1), (20, 20, 20), -1)
-        cv2.rectangle(out, (bx0, by0), (bx1, by1), (0, 220, 255), 2)
+            lbl = "Form Match --"
+        knee_i = 26 if kicking_side == "RIGHT" else 25
+        ankle_i = 28 if kicking_side == "RIGHT" else 27
+        if _finite_pt(pts_user, knee_i):
+            tx, ty = int(round(pts_user[knee_i, 0])) + 10, int(round(pts_user[knee_i, 1])) - 10
+        elif _finite_pt(pts_user, ankle_i):
+            tx, ty = int(round(pts_user[ankle_i, 0])) + 10, int(round(pts_user[ankle_i, 1])) - 10
+        else:
+            tx, ty = 16, h - 24
+        tw, th = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
+        tx = int(np.clip(tx, 8, max(8, w - tw - 12)))
+        ty = int(np.clip(ty, th + 8, max(th + 8, h - 8)))
+        cv2.rectangle(out, (tx - 6, ty - th - 6), (tx + tw + 6, ty + 6), (18, 18, 18), -1)
+        cv2.rectangle(out, (tx - 6, ty - th - 6), (tx + tw + 6, ty + 6), (255, 180, 40), 1)
         cv2.putText(
             out,
-            label,
-            (16, h - 14),
+            lbl,
+            (tx, ty),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.85,
+            0.55,
             (240, 250, 255),
             2,
             cv2.LINE_AA,
@@ -744,7 +923,7 @@ def process_video(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Football strike video processor with ghost overlay.")
+    p = argparse.ArgumentParser(description="Football strike video processor with biomechanical heatmap overlay.")
     p.add_argument("--input", "-i", type=Path, required=True, help="Input video path")
     p.add_argument("--output", "-o", type=Path, required=True, help="Output MP4 path")
     p.add_argument("--min-detection", type=float, default=0.5)
