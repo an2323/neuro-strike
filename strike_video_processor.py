@@ -1439,28 +1439,10 @@ def _try_build_ai_cinematic_commentary_video(
         I = min(B + 1, T - 1, phase_end)
     cine_pk = int(phases.get("cinematic_peak_idx", peak_idx))
     if F <= I:
-        F = min(
-            T - 1,
-            max(I + 1, min(phase_end, cine_pk + max(12, int(0.35 * fps)), T - 1)),
-        )
+        F = min(T - 1, max(I + 1, min(phase_end, cine_pk + max(12, int(0.35 * fps)), T - 1)))
 
-    contact_c = int(phases.get("contact_idx", int(np.clip(I + max(1, (F - I) // 2), B + 1, F - 1))))
-    gap_f = int(phases.get("freeze_gap_frames", max(20, int(0.42 * max(fps, 1e-3)))))
-    span_bf = max(1, F - B)
-    # Phase-2 freeze: near foot-on-ball (contact), between coil (B) and follow-through (F) — not capped to pk-1.
-    p2_lo = B + max(1, min(gap_f, max(2, span_bf // 4)))
-    if p2_lo > F - 1:
-        max_room = max(1, F - B - 2)
-        gap_eff = min(gap_f, max_room) if max_room >= 1 else 1
-        p2_lo = B + max(1, gap_eff)
-    if p2_lo > F - 1:
-        p2_lo = max(B + 1, F - 1)
-    p2_hi = max(p2_lo, min(F - 1, T - 2))
-    P2 = int(np.clip(contact_c, p2_lo, p2_hi))
-    if P2 <= B:
-        P2 = min(B + 1, F - 1)
-    if P2 >= F:
-        P2 = max(B + 1, F - 1)
+    # Phase-2: midpoint between coil (B) and follow-through (F) — lands near ball contact.
+    P2 = int(np.clip((B + F) // 2, B + 1, F - 1))
 
     kick_hip = 24 if kicking_side == "RIGHT" else 23
     kick_knee = 26 if kicking_side == "RIGHT" else 25
@@ -2260,22 +2242,7 @@ def process_video(
     )
     B_sb = int(phases_sb["backswing_peak_idx"])
     F_sb = int(phases_sb["follow_through_idx"])
-    contact_sb = int(phases_sb.get("contact_idx", int(phases_sb.get("pre_strike_idx", int(phases_sb["impact_idx"])))))
-    gap_sb = int(phases_sb.get("freeze_gap_frames", max(20, int(0.42 * max(float(fps), 1e-3)))))
-    span_s = max(1, F_sb - B_sb)
-    p2_lo = B_sb + max(1, min(gap_sb, max(2, span_s // 4)))
-    if p2_lo > F_sb - 1:
-        max_room_sb = max(1, F_sb - B_sb - 2)
-        gap_eff_sb = min(gap_sb, max_room_sb) if max_room_sb >= 1 else 1
-        p2_lo = B_sb + max(1, gap_eff_sb)
-    if p2_lo > F_sb - 1:
-        p2_lo = max(B_sb + 1, F_sb - 1)
-    p2_hi = max(p2_lo, min(F_sb - 1, int(smooth.shape[0]) - 2))
-    impact_snap = int(np.clip(contact_sb, p2_lo, p2_hi))
-    if impact_snap <= B_sb:
-        impact_snap = min(B_sb + 1, F_sb - 1)
-    if impact_snap >= F_sb:
-        impact_snap = max(B_sb + 1, F_sb - 1)
+    impact_snap = int(np.clip((B_sb + F_sb) // 2, B_sb + 1, F_sb - 1))
     snap_frame_targets: Dict[str, int] = {
         "windup": B_sb,
         "impact": impact_snap,
