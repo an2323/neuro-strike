@@ -1,4 +1,4 @@
-# StrikeLab — AMD ROCm Football Biomechanics
+# [StrikeLab — AMD ROCm Football Biomechanics (open HF)](https://huggingface.co/spaces/an2323/neuro-strike)
 
 <div align="center">
 
