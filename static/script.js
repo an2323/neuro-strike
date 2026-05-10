@@ -37,13 +37,6 @@
   const resetBtn = document.getElementById("reset-btn");
   const errorBanner = document.getElementById("error-banner");
   const fileLabel = document.querySelector('label[for="strike-file"]');
-  const aiCinematicWrap = document.getElementById("ai-cinematic-wrap");
-  const aiCinematicBtn = document.getElementById("ai-cinematic-btn");
-  const aiCinematicMissing = document.getElementById("ai-cinematic-missing");
-  const aiCinematicModal = document.getElementById("ai-cinematic-modal");
-  const aiCinematicVideo = document.getElementById("ai-cinematic-video");
-  const aiCinematicClose = document.getElementById("ai-cinematic-close");
-  const aiCinematicBackdrop = document.getElementById("ai-cinematic-backdrop");
 
   const STATUS_MESSAGES = [
     [
@@ -62,23 +55,6 @@
 
   let statusInterval = null;
   let latestCoachingAudioText = "";
-  let aiCinematicUrl = "";
-
-  function closeAiCinematicModal() {
-    if (aiCinematicModal) aiCinematicModal.hidden = true;
-    if (aiCinematicVideo) {
-      aiCinematicVideo.pause();
-      aiCinematicVideo.removeAttribute("src");
-      aiCinematicVideo.load();
-    }
-  }
-
-  function openAiCinematicModal(url) {
-    if (!aiCinematicModal || !aiCinematicVideo || !url) return;
-    aiCinematicVideo.src = url;
-    aiCinematicModal.hidden = false;
-    aiCinematicVideo.play().catch(() => {});
-  }
 
   function showError(msg) {
     errorBanner.textContent = msg || "Something went wrong.";
@@ -113,6 +89,50 @@
     }
   }
 
+  function fmtImpactSpeed(v) {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 1e-3 ? `${n.toFixed(1)} px/s` : "Analysis pending";
+  }
+
+  function fmtBackswingDeg(v) {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 1e-3 ? `${n.toFixed(1)}°` : "Analysis pending";
+  }
+
+  function fmtTorsoStability(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "Analysis pending";
+    if (n <= 1e-6) return "Optimal range";
+    return `${n.toFixed(2)}°`;
+  }
+
+  /** Normalize drill reference to https://www.youtube.com/embed/ID */
+  function youtubeEmbedFromId(raw) {
+    if (raw == null || raw === "") return "about:blank";
+    const s = String(raw).trim();
+    if (/^[\w-]{11}$/.test(s)) return `https://www.youtube.com/embed/${s}`;
+    let ustr = s;
+    if (ustr.startsWith("//")) ustr = `https:${ustr}`;
+    else if (!/^https?:/i.test(ustr)) ustr = `https://${ustr}`;
+    try {
+      const u = new URL(ustr);
+      const host = u.hostname.replace(/^www\./, "");
+      if (host === "youtu.be") {
+        const id = u.pathname.replace(/^\//, "").split("/")[0];
+        if (/^[\w-]{11}$/.test(id)) return `https://www.youtube.com/embed/${id}`;
+      }
+      if (host.includes("youtube.com")) {
+        const v = u.searchParams.get("v");
+        if (v && /^[\w-]{11}$/.test(v)) return `https://www.youtube.com/embed/${v}`;
+        const m = u.pathname.match(/\/embed\/([\w-]{11})/);
+        if (m) return `https://www.youtube.com/embed/${m[1]}`;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    return "about:blank";
+  }
+
   function resetUi() {
     setProcessing(false);
     clearError();
@@ -140,24 +160,19 @@
     if (coachWeakness) coachWeakness.textContent = "❌ --";
     if (coachAdvice) coachAdvice.textContent = "💡 --";
     if (drill1Video) drill1Video.src = "about:blank";
-    if (drill1Badge) drill1Badge.textContent = "#1 PRIORITY";
+    if (drill1Badge) drill1Badge.textContent = "Primary focus";
     if (drill1Title) drill1Title.textContent = "--";
-    if (drill1Why) drill1Why.textContent = "Why this? --";
+    if (drill1Why) drill1Why.textContent = "Rationale —";
     if (drill1Text) drill1Text.textContent = "--";
     if (drill2Video) drill2Video.src = "about:blank";
-    if (drill2Badge) drill2Badge.textContent = "#2 SECONDARY";
+    if (drill2Badge) drill2Badge.textContent = "Supporting focus";
     if (drill2Title) drill2Title.textContent = "--";
-    if (drill2Why) drill2Why.textContent = "Why this? --";
+    if (drill2Why) drill2Why.textContent = "Rationale —";
     if (drill2Text) drill2Text.textContent = "--";
     if (schedulePrematch) schedulePrematch.textContent = "--";
     if (scheduleRestday) scheduleRestday.textContent = "--";
     if (analysisTimeBadge) analysisTimeBadge.textContent = "Processed in --s";
     latestCoachingAudioText = "";
-    aiCinematicUrl = "";
-    if (aiCinematicWrap) aiCinematicWrap.hidden = true;
-    if (aiCinematicBtn) aiCinematicBtn.hidden = true;
-    if (aiCinematicMissing) aiCinematicMissing.hidden = true;
-    closeAiCinematicModal();
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
   }
 
@@ -184,21 +199,14 @@
         return;
       }
       const videoName = data.video_filename || data.filename;
-      const reportName = data.report_filename;
-      const videoUrl = data.video_url || (videoName ? `/results/${encodeURIComponent(videoName)}` : "");
-      const reportUrl = data.report_url || (reportName ? `/results/${encodeURIComponent(reportName)}` : "");
-      aiCinematicUrl =
-        typeof data.ai_commentary_video_url === "string" && data.ai_commentary_video_url.length > 0
-          ? data.ai_commentary_video_url
-          : "";
-      if (aiCinematicWrap) aiCinematicWrap.hidden = false;
-      if (aiCinematicBtn) aiCinematicBtn.hidden = !aiCinematicUrl;
-      if (aiCinematicMissing) aiCinematicMissing.hidden = !!aiCinematicUrl;
-      const coaching = data.coaching_data || {};
       if (!videoName) {
         showError("Missing result filename in response.");
         return;
       }
+      const reportName = data.report_filename;
+      const videoUrl = data.video_url || `/results/${encodeURIComponent(videoName)}`;
+      const reportUrl = data.report_url || (reportName ? `/results/${encodeURIComponent(reportName)}` : "");
+      const coaching = data.coaching_data || {};
       resultVideo.src = videoUrl;
       if (reportImage && reportName) {
         reportImage.src = reportUrl;
@@ -213,9 +221,9 @@
         const score = Number(coaching.overall_form_score);
         if (coachScore) coachScore.textContent = Number.isFinite(score) ? `${Math.round(score)}%` : "--%";
         const stats = coaching.key_stats || {};
-        if (statImpactSpeed) statImpactSpeed.textContent = Number.isFinite(Number(stats.impact_speed)) ? `${Number(stats.impact_speed).toFixed(1)} px/s` : "--";
-        if (statBackswing) statBackswing.textContent = Number.isFinite(Number(stats.max_backswing_angle)) ? `${Number(stats.max_backswing_angle).toFixed(1)}°` : "--";
-        if (statTorsoStability) statTorsoStability.textContent = Number.isFinite(Number(stats.torso_stability)) ? `${Number(stats.torso_stability).toFixed(2)}°` : "--";
+        if (statImpactSpeed) statImpactSpeed.textContent = fmtImpactSpeed(stats.impact_speed);
+        if (statBackswing) statBackswing.textContent = fmtBackswingDeg(stats.max_backswing_angle);
+        if (statTorsoStability) statTorsoStability.textContent = fmtTorsoStability(stats.torso_stability);
         const strengths = Array.isArray(coaching.strengths) ? coaching.strengths : [];
         const weaknesses = Array.isArray(coaching.weaknesses) ? coaching.weaknesses : [];
         if (coachStrength) coachStrength.textContent = `✅ ${strengths[0] || "--"}`;
@@ -224,16 +232,15 @@
         const drills = Array.isArray(coaching.recommended_drills) ? coaching.recommended_drills : [];
         const d1 = drills[0] || {};
         const d2 = drills[1] || {};
-        const mkEmbed = (id) => id ? `https://www.youtube.com/embed/${encodeURIComponent(id)}` : "about:blank";
-        if (drill1Video) drill1Video.src = mkEmbed(d1.video_id);
-        if (drill1Badge) drill1Badge.textContent = d1.priority_badge || "#1 PRIORITY";
+        if (drill1Video) drill1Video.src = youtubeEmbedFromId(d1.video_id);
+        if (drill1Badge) drill1Badge.textContent = d1.priority_badge || "Primary focus";
         if (drill1Title) drill1Title.textContent = d1.title || "--";
-        if (drill1Why) drill1Why.textContent = `Why this? ${d1.why_text || "--"}`;
+        if (drill1Why) drill1Why.textContent = `Rationale: ${d1.why_text || "—"}`;
         if (drill1Text) drill1Text.textContent = d1.instruction || "--";
-        if (drill2Video) drill2Video.src = mkEmbed(d2.video_id);
-        if (drill2Badge) drill2Badge.textContent = d2.priority_badge || "#2 SECONDARY";
+        if (drill2Video) drill2Video.src = youtubeEmbedFromId(d2.video_id);
+        if (drill2Badge) drill2Badge.textContent = d2.priority_badge || "Supporting focus";
         if (drill2Title) drill2Title.textContent = d2.title || "--";
-        if (drill2Why) drill2Why.textContent = `Why this? ${d2.why_text || "--"}`;
+        if (drill2Why) drill2Why.textContent = `Rationale: ${d2.why_text || "—"}`;
         if (drill2Text) drill2Text.textContent = d2.instruction || "--";
         const pres = d1.prescription || {};
         if (schedulePrematch) schedulePrematch.textContent = pres.pre_match || "--";
@@ -261,13 +268,6 @@
 
   resetBtn.addEventListener("click", resetUi);
 
-  if (aiCinematicBtn) {
-    aiCinematicBtn.addEventListener("click", () => {
-      if (aiCinematicUrl) openAiCinematicModal(aiCinematicUrl);
-    });
-  }
-  if (aiCinematicClose) aiCinematicClose.addEventListener("click", closeAiCinematicModal);
-  if (aiCinematicBackdrop) aiCinematicBackdrop.addEventListener("click", closeAiCinematicModal);
   if (playAudioBtn) {
     playAudioBtn.addEventListener("click", () => {
       if (!latestCoachingAudioText) return;

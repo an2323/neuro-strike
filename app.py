@@ -12,7 +12,7 @@ Port / host: STRIKE_LAB_PORT (default 5050), STRIKE_LAB_HOST (default 0.0.0.0).
 
 Routes:
   GET  /                 — Analyzer UI (dark / neon)
-  POST /analyze-video    — Upload .mp4 / .mov, run strike_video_processor.process_video (optional *_ai_cinematic_analysis.mp4 when moviepy+gTTS are installed)
+  POST /analyze-video    — Upload .mp4 / .mov; JSON ``video_url`` is the narrated biomechanical analysis MP4 (``result_*.mp4``).
   GET  /results/<name>   — Stream processed MP4
 """
 from __future__ import annotations
@@ -84,7 +84,6 @@ def analyze_video():
     upload_path = UPLOAD_DIR / upload_name
     result_path = RESULTS_DIR / result_name
     report_path = RESULTS_DIR / report_name
-    ai_result_path = result_path.with_name(result_path.stem + "_ai_cinematic_analysis.mp4")
 
     try:
         f.save(str(upload_path))
@@ -108,10 +107,6 @@ def analyze_video():
             pass
         try:
             report_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            ai_result_path.unlink(missing_ok=True)
         except OSError:
             pass
         return jsonify(
@@ -138,10 +133,6 @@ def analyze_video():
             report_path.unlink(missing_ok=True)
         except OSError:
             pass
-        try:
-            ai_result_path.unlink(missing_ok=True)
-        except OSError:
-            pass
         return jsonify({"ok": False, "error": str(e)}), 500
     except Exception:
         logger.exception("Processor failed (unexpected)")
@@ -155,10 +146,6 @@ def analyze_video():
             pass
         try:
             report_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            ai_result_path.unlink(missing_ok=True)
         except OSError:
             pass
         return jsonify({"ok": False, "error": "Video processing failed. See server logs."}), 500
@@ -179,13 +166,6 @@ def analyze_video():
         orbit_path = RESULTS_DIR / orbit_name
         if orbit_path.is_file():
             orbit_3d_url = url_for("serve_result", filename=orbit_name)
-    ai_commentary_video_url = None
-    ai_meta = result_meta.get("ai_commentary_video_path")
-    if ai_meta:
-        ai_name = Path(str(ai_meta)).name
-        ai_path = RESULTS_DIR / ai_name
-        if ai_path.is_file():
-            ai_commentary_video_url = url_for("serve_result", filename=ai_name)
     payload = {
         "ok": True,
         "video_filename": video_name,
@@ -193,7 +173,6 @@ def analyze_video():
         "video_url": video_url,
         "report_url": report_url,
         "orbit_3d_url": orbit_3d_url,
-        "ai_commentary_video_url": ai_commentary_video_url,
         "coaching_data": coaching_data,
     }
     logger.info("Analysis complete -> video=%s report=%s time=%.2fs", video_name, report_name, analysis_time_sec)

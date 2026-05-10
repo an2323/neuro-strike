@@ -75,14 +75,23 @@
         border-radius: 8px;
         background: rgba(15, 19, 24, 0.8);
       }
-      .amd-pill {
-        font-size: 0.72rem;
+      .product-pill {
+        font-size: 0.68rem;
         font-weight: 600;
-        color: #fff;
-        background: linear-gradient(90deg, #ed1c24, #b01018);
+        color: #c8e8ff;
+        background: rgba(0, 240, 255, 0.08);
+        border: 1px solid rgba(0, 240, 255, 0.35);
         padding: 6px 12px;
         border-radius: 999px;
-        letter-spacing: 0.06em;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .insights-heading {
+        font-size: 0.95rem;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: #dfe8f2;
       }
       .card {
         background: linear-gradient(180deg, rgba(15, 19, 24, 0.95), rgba(10, 13, 18, 0.98));
@@ -226,104 +235,6 @@
       }
       #result-section {
         margin-top: 24px;
-      }
-      .cinematic-cta {
-        margin: 14px 0 4px;
-      }
-      .btn-cinematic {
-        width: 100%;
-        font-weight: 700;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-        font-size: 0.88rem;
-        box-shadow: var(--glow);
-      }
-      .cinematic-missing {
-        margin: 0;
-        padding: 14px 16px;
-        border-radius: 14px;
-        border: 1px dashed rgba(0, 240, 255, 0.35);
-        background: rgba(0, 240, 255, 0.06);
-        font-size: 0.84rem;
-        line-height: 1.55;
-        color: var(--muted);
-      }
-      .cinematic-missing strong {
-        color: var(--text);
-        display: block;
-        margin-bottom: 8px;
-        font-size: 0.88rem;
-      }
-      .cinematic-missing code {
-        display: inline-block;
-        margin-top: 6px;
-        padding: 6px 10px;
-        border-radius: 8px;
-        background: rgba(0, 0, 0, 0.45);
-        border: 1px solid var(--border);
-        font-family: "JetBrains Mono", monospace;
-        font-size: 0.78rem;
-        color: #b8e8ff;
-        word-break: break-all;
-      }
-      .cinematic-modal {
-        position: fixed;
-        inset: 0;
-        z-index: 300;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 20px;
-      }
-      .cinematic-modal[hidden] {
-        display: none !important;
-      }
-      .cinematic-modal__backdrop {
-        position: absolute;
-        inset: 0;
-        background: rgba(2, 4, 8, 0.78);
-        backdrop-filter: blur(6px);
-      }
-      .cinematic-modal__dialog {
-        position: relative;
-        z-index: 1;
-        width: min(920px, 96vw);
-        max-height: min(88vh, 900px);
-        background: linear-gradient(180deg, rgba(18, 24, 32, 0.98), rgba(8, 10, 14, 0.99));
-        border: 1px solid var(--neon);
-        border-radius: 18px;
-        padding: 18px 18px 20px;
-        box-shadow: 0 0 0 1px rgba(0, 240, 255, 0.12), 0 28px 80px rgba(0, 0, 0, 0.65);
-      }
-      .cinematic-modal__dialog h3 {
-        margin: 0 0 12px;
-        font-size: 1rem;
-        font-weight: 600;
-        color: var(--neon);
-        letter-spacing: 0.04em;
-      }
-      .cinematic-modal__close {
-        position: absolute;
-        top: 10px;
-        right: 12px;
-        border: none;
-        background: transparent;
-        color: var(--muted);
-        font-size: 1.6rem;
-        line-height: 1;
-        cursor: pointer;
-        padding: 4px 8px;
-        border-radius: 8px;
-      }
-      .cinematic-modal__close:hover {
-        color: var(--text);
-        background: rgba(255, 255, 255, 0.06);
-      }
-      .cinematic-modal__video {
-        width: 100%;
-        max-height: min(72vh, 720px);
-        border-radius: 12px;
-        background: #000;
       }
       .video-shell {
         border-radius: 16px;
@@ -477,6 +388,16 @@
         font-size: 0.8rem;
         margin: 4px 0;
       }
+      .platform-footer {
+        margin-top: 36px;
+        padding-top: 16px;
+        border-top: 1px solid var(--border);
+        font-family: "JetBrains Mono", monospace;
+        font-size: 0.68rem;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+        text-align: center;
+      }
     </style>
   </head>
   <body>
@@ -498,7 +419,7 @@
             <div class="tag">Ghost overlay · Form match · Power trace</div>
           </div>
         </div>
-        <span class="amd-pill">AMD INSTINCT</span>
+        <span class="product-pill">MI300X lab</span>
       </header>
 
       <div id="upload-card" class="card">
@@ -513,31 +434,16 @@
       </div>
 
       <div id="result-section" class="card" hidden>
-        <h2>Analysis output</h2>
-        <p class="hint">Cinematic replay + biomechanical storyboard report</p>
+        <h2 class="insights-heading">Biomechanical performance insights</h2>
+        <p class="hint">Player shows the narrated biomechanical analysis export. Storyboard covers three strike phases.</p>
         <div class="video-shell">
           <video id="result-video" controls playsinline autoplay></video>
-        </div>
-        <div class="cinematic-cta" id="ai-cinematic-wrap" hidden>
-          <button type="button" class="btn-primary btn-cinematic" id="ai-cinematic-btn" hidden>
-            WATCH AI NARRATED ANALYSIS
-          </button>
-          <div class="cinematic-missing" id="ai-cinematic-missing" hidden>
-            <strong>AI narrated cinematic recap</strong>
-            The server did not produce this MP4. Common causes: MoviePy/gTTS not installed in the
-            <em>same</em> Python venv as Waitress/Flask, or the export step failed (see server logs:
-            <code>AI cinematic commentary export failed</code>).
-            Install in that venv, then restart the app and analyze again:
-            <code>pip install moviepy gTTS</code>
-            (gTTS needs outbound network). If MoviePy is already installed, ensure it is importable as
-            <code>python -c "from moviepy.video.io.ImageSequenceClip import ImageSequenceClip"</code>.
-          </div>
         </div>
         <div class="report-wrap">
           <img id="report-image" alt="Biomechanical storyboard report" hidden />
         </div>
         <section class="coach-panel" id="coach-panel" hidden>
-          <h3 style="margin: 0 0 8px 0">AI COACH VERDICT</h3>
+          <h3 style="margin: 0 0 8px 0; font-size: 0.82rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--neon)">Elite coaching analysis</h3>
           <div class="coach-grid">
             <div>
               <div class="coach-score" id="coach-score">--%</div>
@@ -555,11 +461,11 @@
             <li id="coach-advice">💡 --</li>
           </ul>
           <div class="drills-block">
-            <div class="drills-title">NEXT STEPS: RECOMMENDED DRILLS</div>
-            <div class="drills-title" style="margin-top:-2px; color: var(--neon);">WATCH &amp; LEARN: ELITE TRAINING DRILLS</div>
+            <div class="drills-title">Recommended technical drills</div>
+            <div class="drills-title" style="margin-top: -2px; color: var(--neon)">Reference demonstrations</div>
             <div class="drills-grid">
               <article class="drill-card">
-                <div class="drill-badge" id="drill1-badge">#1 PRIORITY</div>
+                <div class="drill-badge" id="drill1-badge">Primary focus</div>
                 <div class="drill-embed">
                   <iframe
                     id="drill1-video"
@@ -570,11 +476,11 @@
                   ></iframe>
                 </div>
                 <div class="drill-title" id="drill1-title">--</div>
-                <div class="drill-why" id="drill1-why">Why this? --</div>
+                <div class="drill-why" id="drill1-why">Rationale —</div>
                 <div class="drill-text" id="drill1-text">--</div>
               </article>
               <article class="drill-card">
-                <div class="drill-badge" id="drill2-badge">#2 SECONDARY</div>
+                <div class="drill-badge" id="drill2-badge">Supporting focus</div>
                 <div class="drill-embed">
                   <iframe
                     id="drill2-video"
@@ -585,7 +491,7 @@
                   ></iframe>
                 </div>
                 <div class="drill-title" id="drill2-title">--</div>
-                <div class="drill-why" id="drill2-why">Why this? --</div>
+                <div class="drill-why" id="drill2-why">Rationale —</div>
                 <div class="drill-text" id="drill2-text">--</div>
               </article>
             </div>
@@ -602,7 +508,7 @@
             </div>
           </div>
           <div class="coach-footer">
-            <span>Hardware Acceleration: AMD Instinct™ MI300X | Framework: ROCm 6.0</span>
+            <span>Accelerated biomechanics pipeline</span>
             <span id="analysis-time-badge">Processed in --s</span>
           </div>
           <div style="margin-top:10px;">
@@ -614,15 +520,8 @@
           <button type="button" class="btn-secondary" id="reset-btn">Reset</button>
         </div>
       </div>
-    </div>
 
-    <div id="ai-cinematic-modal" class="cinematic-modal" hidden>
-      <div class="cinematic-modal__backdrop" id="ai-cinematic-backdrop" aria-hidden="true"></div>
-      <div class="cinematic-modal__dialog" role="dialog" aria-modal="true" aria-labelledby="ai-cinematic-title">
-        <button type="button" class="cinematic-modal__close" id="ai-cinematic-close" aria-label="Close">&times;</button>
-        <h3 id="ai-cinematic-title">AI narrated cinematic analysis</h3>
-        <video id="ai-cinematic-video" class="cinematic-modal__video" controls playsinline></video>
-      </div>
+      <footer class="platform-footer">Powered by AMD ROCm 6.0 | MI300X Accelerated</footer>
     </div>
 
     <script src="{{ url_for('static', filename='script.js') }}"></script>

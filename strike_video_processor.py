@@ -3,11 +3,11 @@
 NeuroStrike — offline football strike video post-processor.
 
 Input: path to a video file (any format OpenCV can decode).
-Output: annotated MP4 with MediaPipe pose, Savitzky–Golay smoothing, and a
-single-skeleton biomechanical heatmap (blue->red error gradient), plus power meter and form-match %.
+Output: narrated biomechanical analysis MP4 (MediaPipe pose, Savitzky–Golay smoothing,
+on-frame heatmap-style overlay, TTS commentary, freeze / slow segments), plus storyboard PNG.
 
 Usage:
-  python strike_video_processor.py --input kick.mp4 --output kick_heatmap.mp4
+  python strike_video_processor.py --input kick.mp4 --output kick_analysis.mp4
 
 Optional: pip install -r requirements_strike_video.txt (adds scipy for Savitzky–Golay).
 """
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import glob
 import logging
+import math
 import shutil
 import subprocess
 import sys
@@ -46,7 +47,7 @@ _SHOULDER_IDXS = (11, 12)
 
 
 def _try_ffmpeg_browser_mp4(path: Path) -> None:
-    """Re-encode to H.264 + yuv420p + faststart so <video> and direct URL playback work reliably."""
+    """Re-encode video to H.264 + yuv420p + faststart; keep AAC narration (do not strip audio)."""
     if not shutil.which("ffmpeg"):
         logger.warning(
             "ffmpeg not on PATH — MP4 may use mpeg4 (mp4v) and not play in Chrome/Safari. "
@@ -73,7 +74,10 @@ def _try_ffmpeg_browser_mp4(path: Path) -> None:
                 "yuv420p",
                 "-movflags",
                 "+faststart",
-                "-an",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
                 str(tmp),
             ],
             check=True,
@@ -96,12 +100,8 @@ JOINT_ERROR_MAX_DEG = 30.0
 SUBJECT_MAX_CENTROID_JUMP = 0.16
 SUBJECT_MAX_HEIGHT_RATIO = 1.45
 SUBJECT_MIN_HEIGHT_RATIO = 0.62
-STORYBOARD_PHASE_TARGETS: Tuple[Tuple[str, float], ...] = (
-    ("approach", 0.10),
-    ("windup", 0.30),
-    ("impact", 0.50),
-    ("follow", 0.80),
-)
+# Storyboard strip order (three kick panels; frames come from cinematic indices, not these floats).
+STORYBOARD_PANEL_ORDER: Tuple[str, ...] = ("windup", "impact", "follow")
 # Joints used for form match (core + kicking chain); indices are BlazePose order
 FORM_MATCH_LM_INDICES = (
     0,
@@ -337,6 +337,25 @@ def _phase_t(frame_idx: int, phase_start: int, phase_end: int) -> float:
     return float(np.clip((frame_idx - phase_start) / span, 0.0, 1.0))
 
 
+def _heatmap_overlay_window(
+    frame_idx: int, phase_start: int, phase_end: int, fps: float
+) -> Tuple[bool, float]:
+    """
+    Whether to draw joint-error heatmap colors (vs neutral skeleton), and ghost phase_t.
+
+    After ``phase_end`` we keep heat coloring for a short tail using follow-through ghost (t=1)
+    so the clip does not snap to a flat blue outline right after the strike.
+    """
+    post = max(24, int(1.35 * max(fps, 1.0)))
+    if frame_idx < phase_start:
+        return False, 0.0
+    if frame_idx <= phase_end:
+        return True, _phase_t(frame_idx, phase_start, phase_end)
+    if frame_idx <= phase_end + post:
+        return True, 1.0
+    return False, 0.0
+
+
 def _midpoint_xy(points_xy: np.ndarray, idxs: Tuple[int, int], vis: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
     vals: List[np.ndarray] = []
     for i in idxs:
@@ -458,18 +477,53 @@ def _ideal_support_knee_interior_deg(phase_t: float) -> float:
     return float(np.interp(float(np.clip(phase_t, 0.0, 1.0)), t_breaks, ideals))
 
 
-def _detect_kicking_leg(smooth: np.ndarray, vis: np.ndarray, peak_idx: int) -> str:
-    """Identify the kicking leg by comparing ankle displacement near the peak frame."""
-    lo = max(0, peak_idx - 4)
-    hi = min(smooth.shape[0], peak_idx + 5)
+def _detect_kicking_leg(
+    smooth: np.ndarray,
+    vis: np.ndarray,
+    peak_idx: int,
+    fps: float,
+    phase_start: int,
+    phase_end: int,
+) -> str:
+    """
+    Identify the kicking leg for the strike window.
+
+    A short ±4f window around the *global* max(L,R) speed peak often lies on the plant
+    foot shuffling beside the ball (high motion but not the instep strike). We instead
+    score each ankle across the full detected strike phase: peak speed wins, with total
+    displacement as a tie-breaker.
+    """
+    T = int(smooth.shape[0])
+    lo = int(max(0, phase_start))
+    hi = int(min(T, max(lo + 2, phase_end + 1)))
+    sp_l = _kick_ankle_speed_norm(smooth, vis, fps, 27)
+    sp_r = _kick_ankle_speed_norm(smooth, vis, fps, 28)
+    mxl = float(np.max(sp_l[lo:hi])) if hi > lo + 1 else 0.0
+    mxr = float(np.max(sp_r[lo:hi])) if hi > lo + 1 else 0.0
+
     sl = sr = 0.0
     for i in range(lo + 1, hi):
         if vis[i, 27] > 0.2 and vis[i - 1, 27] > 0.2:
             sl += float(np.linalg.norm(smooth[i, 27] - smooth[i - 1, 27]))
         if vis[i, 28] > 0.2 and vis[i - 1, 28] > 0.2:
             sr += float(np.linalg.norm(smooth[i, 28] - smooth[i - 1, 28]))
-    kicking = "LEFT" if sl >= sr else "RIGHT"
-    logger.info("Kicking leg detected: %s (left_disp=%.4f  right_disp=%.4f)", kicking, sl, sr)
+
+    if mxl >= mxr * 1.12:
+        kicking = "LEFT"
+    elif mxr >= mxl * 1.12:
+        kicking = "RIGHT"
+    else:
+        kicking = "LEFT" if sl >= sr else "RIGHT"
+    logger.info(
+        "Kicking leg detected: %s (phase f=%d..%d  L_peak=%.4f R_peak=%.4f  L_disp=%.4f R_disp=%.4f)",
+        kicking,
+        lo,
+        hi - 1,
+        mxl,
+        mxr,
+        sl,
+        sr,
+    )
     return kicking
 
 
@@ -645,7 +699,17 @@ def _form_match_from_joint_errors(joint_errors: Dict[int, float]) -> float:
     return float(np.clip(100.0 * (1.0 - mean_v / JOINT_ERROR_MAX_DEG), 0.0, 100.0))
 
 
-def generate_coach_verdict(metrics: Dict[str, float]) -> Dict[str, Any]:
+def _metric_float(v: Any) -> Optional[float]:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(x):
+        return None
+    return x
+
+
+def generate_coach_verdict(metrics: Dict[str, Any]) -> Dict[str, Any]:
     """
     Build structured coaching verdict from analyzed metrics.
 
@@ -654,77 +718,110 @@ def generate_coach_verdict(metrics: Dict[str, float]) -> Dict[str, Any]:
     strengths: List[str] = []
     weaknesses: List[str] = []
 
-    impact_speed = float(metrics.get("impact_speed", 0.0))
-    backswing_angle = float(metrics.get("max_backswing_angle", 0.0))
-    torso_stability = float(metrics.get("torso_stability", 0.0))
-    overall_form = float(metrics.get("overall_form_score", 0.0))
-    knee_extension = float(metrics.get("knee_extension_at_impact", 0.0))
-    lean_err = float(metrics.get("lean_error", 999.0))
+    impact_speed = _metric_float(metrics.get("impact_speed"))
+    backswing_angle = _metric_float(metrics.get("max_backswing_angle"))
+    torso_stability = _metric_float(metrics.get("torso_stability"))
+    overall_form = _metric_float(metrics.get("overall_form_score")) or 0.0
+    knee_extension = _metric_float(metrics.get("knee_extension_at_impact"))
+    lean_err = _metric_float(metrics.get("lean_error"))
+    if lean_err is None:
+        lean_err = 999.0
 
-    if impact_speed >= 700.0:
-        strengths.append("High swing velocity")
-    if 70.0 <= backswing_angle <= 120.0:
-        strengths.append("Efficient backswing loading")
-    if torso_stability <= 7.0:
-        strengths.append("Stable torso control")
+    if impact_speed is not None and impact_speed >= 700.0:
+        strengths.append("Ankle velocity through contact shows strong distal-chain acceleration.")
+    if backswing_angle is not None and 70.0 <= backswing_angle <= 120.0:
+        strengths.append("Hip–knee sequencing in the preparatory window supports optimal extension timing.")
+    if torso_stability is not None and torso_stability <= 7.0:
+        strengths.append("Center of gravity stays relatively stacked—minimal lateral sway in the trunk.")
     if overall_form >= 75.0:
-        strengths.append("Strong overall form consistency")
-    strengths = strengths[:2] if strengths else ["Good training intent and timing"]
+        strengths.append("Global pose alignment versus the reference manifold is consistently high.")
+    strengths = strengths[:2] if strengths else ["Intent and rhythm through the approach are coachable positives to build on."]
 
-    biggest_issue = "Inconsistent knee extension"
-    if knee_extension < 150.0:
-        biggest_issue = "Inconsistent knee extension"
+    biggest_issue = "Limited optimal extension through the kicking-side knee at release"
+    if knee_extension is not None and knee_extension < 150.0:
+        biggest_issue = "Limited optimal extension through the kicking-side knee at release"
     elif lean_err > 8.0:
-        biggest_issue = "Torso lean not controlled"
-    elif torso_stability > 11.0:
-        biggest_issue = "Torso stability drift"
+        biggest_issue = "Trunk orientation relative to vertical shifts the center of gravity away from an ideal strike base"
+    elif torso_stability is not None and torso_stability > 11.0:
+        biggest_issue = "Variance in torso orientation suggests the core link in the kinetic chain needs bracing work"
     elif overall_form < 60.0:
-        biggest_issue = "General form consistency is low"
+        biggest_issue = "Holistic form match to the elite template is below the threshold we expect for repeatable contact quality"
     weaknesses.append(biggest_issue)
 
-    if "knee" in biggest_issue.lower():
-        advice = "Drive your kicking knee through the ball and finish with a longer extension."
-    elif "lean" in biggest_issue.lower():
-        advice = "Lean your torso slightly forward through contact to keep the strike controlled and low."
-    elif "stability" in biggest_issue.lower():
-        advice = "Keep your core braced and chest quiet during the final swing to stabilize the strike path."
+    if "knee" in biggest_issue.lower() or "extension" in biggest_issue.lower():
+        advice = (
+            "Progress the kicking hip through ball line while chasing full knee extension; "
+            "that sequence improves energy transfer without sacrificing center of gravity."
+        )
+    elif "center of gravity" in biggest_issue.lower() or "gravity" in biggest_issue.lower():
+        advice = (
+            "Micro-adjust trunk angle so the shoulders remain over the support base through impact—"
+            "this keeps the kinetic chain stacked for a cleaner strike window."
+        )
+    elif "kinetic chain" in biggest_issue.lower() or "core link" in biggest_issue.lower():
+        advice = (
+            "Brace the deep core isometrically in the final two steps so ribcage and pelvis move as one unit; "
+            "quiet trunk variance unlocks more predictable optimal extension at the ankle."
+        )
     else:
-        advice = "Slow down your approach by one step and focus on matching the target body angles."
+        advice = (
+            "Tempo the approach one notch slower and rehearse joint-angle checkpoints against the ghost overlay—"
+            "precision in the kinetic chain matters more than raw speed at this stage."
+        )
 
-    # Severity ranking for a personalized plan.
-    knee_sev = max(0.0, min(100.0, (170.0 - knee_extension) * 2.0))
-    stab_sev = max(0.0, min(100.0, max(0.0, torso_stability - 6.0) * 10.0))
-    backswing_sev = max(0.0, min(100.0, max(0.0, 75.0 - backswing_angle) * 2.0))
+    knee_base = knee_extension if knee_extension is not None else 160.0
+    stab_base = torso_stability if torso_stability is not None else 6.0
+    back_base = backswing_angle if backswing_angle is not None else 75.0
+    knee_sev = max(0.0, min(100.0, (170.0 - knee_base) * 2.0))
+    stab_sev = max(0.0, min(100.0, max(0.0, stab_base - 6.0) * 10.0))
+    backswing_sev = max(0.0, min(100.0, max(0.0, 75.0 - back_base) * 2.0))
+
+    knee_why = (
+        f"Addresses terminal knee extension measured at {knee_extension:.1f}°—a key lever for ankle velocity and clean contact."
+        if knee_extension is not None
+        else "Supports terminal knee extension and distal-chain timing when landmark-based knee angle was not fully resolved."
+    )
+    stab_why = (
+        f"Targets trunk variance ({torso_stability:.2f}° std. dev.) so center of gravity and strike path stay coupled."
+        if torso_stability is not None
+        else "Builds trunk stiffness so center of gravity remains stable when rotational stability metrics are incomplete."
+    )
+    back_why = (
+        f"Opens the hip–thigh window (loading near {backswing_angle:.1f}°) to improve whip and optimal extension sequencing."
+        if backswing_angle is not None
+        else "Develops hip mobility and preparatory range so backswing metrics can move into an optimal extension band."
+    )
+
     issues = [
         {
             "metric": "knee_extension",
             "severity": knee_sev,
-            "label_primary": "TOP PRIORITY: IMMEDIATE FIX",
-            "label_secondary": "STABILITY OPTIMIZATION",
-            "title": "Hamstring Flexibility for Power",
+            "label_primary": "Primary biomechanical focus",
+            "label_secondary": "Supporting stability work",
+            "title": "Hamstring flexibility for distal-chain power",
             "video_id": "YfEb9bLJN-Y",
-            "why": f"To fix knee extension ({knee_extension:.1f}°) and increase strike efficiency.",
-            "instruction": "3 sets of 10 reps per leg to improve flexibility before strike practice.",
+            "why": knee_why,
+            "instruction": "Three sets of ten per leg, controlled tempo—prioritize range without collapsing the lumbar spine.",
         },
         {
             "metric": "torso_stability",
             "severity": stab_sev,
-            "label_primary": "TOP PRIORITY: IMMEDIATE FIX",
-            "label_secondary": "STABILITY OPTIMIZATION",
-            "title": "Core Balance for Footballers",
+            "label_primary": "Primary biomechanical focus",
+            "label_secondary": "Supporting stability work",
+            "title": "Core balance for footballers",
             "video_id": "LLmXxom7-GM",
-            "why": f"To stabilize torso drift ({torso_stability:.2f}° variance) and improve strike control.",
-            "instruction": "3 rounds of 45 seconds, keep hips level and core braced.",
+            "why": stab_why,
+            "instruction": "Three rounds of forty-five seconds: ribs down, pelvis level, minimal lateral sway.",
         },
         {
             "metric": "backswing",
             "severity": backswing_sev,
-            "label_primary": "TOP PRIORITY: IMMEDIATE FIX",
-            "label_secondary": "STABILITY OPTIMIZATION",
-            "title": "Hip Mobility & Power",
+            "label_primary": "Primary biomechanical focus",
+            "label_secondary": "Supporting stability work",
+            "title": "Hip mobility and preparatory range",
             "video_id": "iVRIO7KkITU",
-            "why": f"To improve backswing loading ({backswing_angle:.1f}°) and add kick whip speed.",
-            "instruction": "15 seconds each side, 3 rounds; open the hips before striking drills.",
+            "why": back_why,
+            "instruction": "Fifteen seconds each side for three rounds; emphasize hip abduction–external rotation without rushing the foot plant.",
         },
     ]
     issues_sorted = sorted(issues, key=lambda x: float(x["severity"]), reverse=True)
@@ -736,32 +833,37 @@ def generate_coach_verdict(metrics: Dict[str, float]) -> Dict[str, Any]:
         prioritized_drills.append(
             {
                 "rank": rank,
-                "priority_badge": "#1 PRIORITY" if rank == 1 else "#2 SECONDARY",
+                "priority_badge": "Primary focus" if rank == 1 else "Supporting focus",
                 "priority_label": item["label_primary"] if rank == 1 else item["label_secondary"],
                 "title": item["title"],
                 "video_id": item["video_id"],
                 "why_text": item["why"],
                 "instruction": item["instruction"],
                 "prescription": {
-                    "pre_match": "Pre-activation: 1 set, 30% intensity (Focus on movement, don't fatigue muscles).",
-                    "rest_day": "Deep Correction: 3 sets, 80% effort (Build consistency and muscle memory).",
+                    "pre_match": "Pre-activation: one light set at low RPE—prime the kinetic chain without accumulating fatigue.",
+                    "rest_day": "Technical correction: three quality sets at moderate RPE with full recovery between efforts.",
                 },
             }
         )
 
-    top_metric_name = (
-        "knee extension"
-        if primary["metric"] == "knee_extension"
-        else ("stability" if primary["metric"] == "torso_stability" else "backswing mechanics")
-    )
+    if primary["metric"] == "knee_extension":
+        focus_phrase = "terminal knee extension and distal-chain timing"
+    elif primary["metric"] == "torso_stability":
+        focus_phrase = "trunk stiffness and center-of-gravity control"
+    else:
+        focus_phrase = "preparatory hip range and optimal extension sequencing"
+
     coaching_audio_text = (
-        f"Based on your strike, our top priority is your {top_metric_name}. "
-        f"I've assigned {prioritized_drills[0]['title']} to fix this. "
-        "Secondary, we'll work on your stability. Follow the pre-activation guide before your next session."
+        f"Scouting read: prioritize {focus_phrase}. "
+        f"Lead drill block—{prioritized_drills[0]['title']}. "
+        f"Secondary emphasis—{prioritized_drills[1]['title']}. "
+        "Use the pre-activation prescription before your next competitive session."
     )
+
+    knee_note = f" Current knee extension at impact reads near {knee_extension:.0f} degrees." if knee_extension is not None else ""
     advice = (
-        f"I've prioritized {prioritized_drills[0]['title']} because your knee extension is at {knee_extension:.0f}°—"
-        "fixing this can unlock roughly 15% more strike power and cleaner contact."
+        f"Program {prioritized_drills[0]['title']} first.{knee_note} "
+        "Improving that segment of the kinetic chain typically yields cleaner ball contact and more repeatable ankle peak velocity."
     )
     return {
         "strengths": strengths,
@@ -957,6 +1059,52 @@ def _detect_cinematic_phases(
     impact_idx = int(np.clip(impact_raw, cine_lo, min(phase_end, pk, T - 1)))
     backswing_peak_idx = int(np.clip(back_raw, back_lo, min(impact_idx, pk, T - 1)))
 
+    # Phase-2 contact proxy: 2D kick-ankle ↔ plant-ankle distance minimum, but only AFTER a
+    # short skip past pk — at t==pk the feet can already look "close" in projection while the
+    # coil freeze is still recent, which collapsed freeze1 and freeze2 to consecutive frames.
+    post_hi = min(phase_end, pk + max(10, int(0.32 * fps_m)))
+    skip_dist = max(3, int(0.08 * fps_m))
+    contact_idx = int(pk)
+    if post_hi >= pk + skip_dist:
+        dists: List[float] = []
+        for t in range(pk + skip_dist, post_hi + 1):
+            if vis[t, kick_ank] > 0.15 and vis[t, stand_ank] > 0.15:
+                ka = smooth[t, kick_ank]
+                sa = smooth[t, stand_ank]
+                dists.append(float(np.hypot(ka[0] - sa[0], ka[1] - sa[1])))
+            else:
+                dists.append(1e6)
+        jm = int(np.argmin(np.array(dists, dtype=np.float64)))
+        contact_idx = pk + skip_dist + jm
+    contact_idx = int(np.clip(contact_idx, pk + skip_dist, post_hi))
+
+    lead = max(2, min(5, int(0.045 * fps_m)))
+    pre_strike_idx = int(np.clip(contact_idx - lead, backswing_peak_idx + 1, contact_idx - 1))
+
+    # Hard minimum time between freeze 1 (coil) and freeze 2 (~0.55–0.85 s @ 24–30 fps).
+    freeze_gap_frames = max(20, int(0.42 * fps_m))
+    pre_strike_idx = max(pre_strike_idx, backswing_peak_idx + freeze_gap_frames)
+    if pre_strike_idx >= contact_idx:
+        contact_idx = min(phase_end, max(contact_idx, pre_strike_idx + lead + 1, pk + skip_dist + 1))
+        pre_strike_idx = min(pre_strike_idx, contact_idx - 1)
+
+    back_cap = min(pk - max(8, int(0.22 * fps_m)), pre_strike_idx - freeze_gap_frames)
+    max_b = min(impact_idx, pk - 3, max(back_lo, pre_strike_idx - freeze_gap_frames))
+    if back_cap >= back_lo and max_b >= back_lo:
+        backswing_peak_idx = int(np.clip(min(backswing_peak_idx, back_cap), back_lo, max_b))
+    if pre_strike_idx < backswing_peak_idx + freeze_gap_frames:
+        pre_strike_idx = min(contact_idx - 1, pk - 1, T - 2, backswing_peak_idx + freeze_gap_frames)
+
+    logger.info(
+        "Cinematic timing: coil B=%d pre_strike=%d contact=%d pk=%d gap=%df (~%.2fs)",
+        backswing_peak_idx,
+        pre_strike_idx,
+        contact_idx,
+        pk,
+        freeze_gap_frames,
+        freeze_gap_frames / max(fps_m, 1e-3),
+    )
+
     ft_lo = min(T - 1, impact_idx + 1)
     ft_hi = int(np.clip(phase_end, ft_lo, T - 1))
     if ft_hi > ft_lo:
@@ -976,6 +1124,12 @@ def _detect_cinematic_phases(
         pts_i[lm, 0] = smooth[impact_idx, lm, 0]
         pts_i[lm, 1] = smooth[impact_idx, lm, 1]
     lean_i = _torso_lean_deg(pts_i)
+
+    pts_c = np.zeros((33, 2), dtype=np.float64)
+    for lm in range(33):
+        pts_c[lm, 0] = smooth[contact_idx, lm, 0]
+        pts_c[lm, 1] = smooth[contact_idx, lm, 1]
+    contact_lean = _torso_lean_deg(pts_c)
     stab_window: List[float] = []
     for fi in range(max(phase_start, impact_idx - 4), min(phase_end, impact_idx + 4) + 1):
         ptn = np.zeros((33, 2), dtype=np.float64)
@@ -997,13 +1151,17 @@ def _detect_cinematic_phases(
     return {
         "backswing_peak_idx": backswing_peak_idx,
         "impact_idx": impact_idx,
+        "pre_strike_idx": pre_strike_idx,
+        "contact_idx": contact_idx,
         "follow_through_idx": follow_through_idx,
         "cinematic_peak_idx": pk,
+        "freeze_gap_frames": freeze_gap_frames,
         "backswing_axis_z": use_z_axis,
         "backswing_angle_deg": backswing_angle,
         "torso_stability_std_deg": torso_std,
         "stability_score": stability_score,
         "impact_lean_deg": float(lean_i or 0.0),
+        "contact_lean_deg": float(contact_lean or 0.0),
         "follow_knee_extension_deg": knee_extension,
     }
 
@@ -1050,6 +1208,7 @@ def _compose_commentary_frame_bgr(
     frame_bgr: np.ndarray,
     fi: int,
     smooth: np.ndarray,
+    seq: np.ndarray,
     vis: np.ndarray,
     w: int,
     h: int,
@@ -1057,21 +1216,22 @@ def _compose_commentary_frame_bgr(
     phase_start: int,
     phase_end: int,
     speeds_norm: np.ndarray,
+    fps: float,
 ) -> np.ndarray:
     """Single heatmap overlay frame (matches main encode heatmap + meter + label)."""
     out = frame_bgr.copy()
-    u_norm = smooth[fi]
+    u_draw = seq[fi]
+    u_smooth = smooth[fi]
     v_row = vis[fi]
     pts_user = np.zeros((33, 2), dtype=np.float64)
     for lm in range(33):
-        pts_user[lm, 0] = u_norm[lm, 0] * w
-        pts_user[lm, 1] = u_norm[lm, 1] * h
+        pts_user[lm, 0] = u_draw[lm, 0] * w
+        pts_user[lm, 1] = u_draw[lm, 1] * h
 
-    in_phase = _in_strike_phase(fi, phase_start, phase_end)
-    phase_t = _phase_t(fi, phase_start, phase_end) if in_phase else 0.0
+    heat_on, ghost_t = _heatmap_overlay_window(fi, phase_start, phase_end, fps)
     form_pct = 0.0
-    if in_phase:
-        ideal_norm = _generate_corrected_ghost(u_norm, v_row, phase_t, kicking_side)
+    if heat_on:
+        ideal_norm = _generate_corrected_ghost(u_smooth, v_row, ghost_t, kicking_side)
         pts_ideal = np.zeros((33, 2), dtype=np.float64)
         for lm in range(33):
             pts_ideal[lm, 0] = ideal_norm[lm, 0] * w
@@ -1087,7 +1247,7 @@ def _compose_commentary_frame_bgr(
     _draw_power_meter(out, fill)
 
     lbl = f"Form Match {form_pct:.0f}%"
-    if not in_phase:
+    if not heat_on:
         lbl = "Form Match --"
     knee_i = 26 if kicking_side == "RIGHT" else 25
     ankle_i = 28 if kicking_side == "RIGHT" else 27
@@ -1113,12 +1273,6 @@ def _compose_commentary_frame_bgr(
         cv2.LINE_AA,
     )
     return out
-
-
-def _read_cap_frame(cap: cv2.VideoCapture, fi: int) -> Optional[np.ndarray]:
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
-    ret, fr = cap.read()
-    return fr if ret else None
 
 
 def _ffprobe_audio_duration_seconds(path: Path) -> Optional[float]:
@@ -1241,6 +1395,7 @@ def _try_build_ai_cinematic_commentary_video(
     input_path: Path,
     output_mp4: Path,
     smooth: np.ndarray,
+    seq: np.ndarray,
     vis: np.ndarray,
     z_seq: np.ndarray,
     speeds_norm: np.ndarray,
@@ -1253,8 +1408,8 @@ def _try_build_ai_cinematic_commentary_video(
     h: int,
 ) -> bool:
     """
-    Standalone narrated recap: intro → freeze (TTS) → slow transitions → outro.
-    Does not replace the primary annotated output.
+    Narrated analysis export: intro → freeze (TTS) → slow transitions → outro.
+    Written to ``output_mp4`` (this is the sole user-facing video from ``process_video``).
     """
     M = _import_moviepy_cinematic_bundle()
     if M is None:
@@ -1271,7 +1426,7 @@ def _try_build_ai_cinematic_commentary_video(
     _video_with_audio = M["video_with_audio"]
 
     T = int(smooth.shape[0])
-    if T < 4 or w < 16 or h < 16:
+    if T < 4 or w < 16 or h < 16 or int(seq.shape[0]) != T:
         return False
 
     phases = _detect_cinematic_phases(
@@ -1289,14 +1444,32 @@ def _try_build_ai_cinematic_commentary_video(
             max(I + 1, min(phase_end, cine_pk + max(12, int(0.35 * fps)), T - 1)),
         )
 
+    contact_c = int(phases.get("contact_idx", int(np.clip(I + max(1, (F - I) // 2), B + 1, F - 1))))
+    gap_f = int(phases.get("freeze_gap_frames", max(20, int(0.42 * max(fps, 1e-3)))))
+    span_bf = max(1, F - B)
+    # Phase-2 freeze: near foot-on-ball (contact), between coil (B) and follow-through (F) — not capped to pk-1.
+    p2_lo = B + max(1, min(gap_f, max(2, span_bf // 4)))
+    if p2_lo > F - 1:
+        max_room = max(1, F - B - 2)
+        gap_eff = min(gap_f, max_room) if max_room >= 1 else 1
+        p2_lo = B + max(1, gap_eff)
+    if p2_lo > F - 1:
+        p2_lo = max(B + 1, F - 1)
+    p2_hi = max(p2_lo, min(F - 1, T - 2))
+    P2 = int(np.clip(contact_c, p2_lo, p2_hi))
+    if P2 <= B:
+        P2 = min(B + 1, F - 1)
+    if P2 >= F:
+        P2 = max(B + 1, F - 1)
+
     kick_hip = 24 if kicking_side == "RIGHT" else 23
     kick_knee = 26 if kicking_side == "RIGHT" else 25
-    stand_ank = 27 if kicking_side == "RIGHT" else 28
+    kick_ank = 28 if kicking_side == "RIGHT" else 27
 
     back_deg = float(phases["backswing_angle_deg"])
     stab = float(phases["stability_score"])
     torso_std = float(phases["torso_stability_std_deg"])
-    lean_i = float(phases["impact_lean_deg"])
+    lean_i = float(phases.get("contact_lean_deg", phases["impact_lean_deg"]))
     knee_ext = float(phases["follow_knee_extension_deg"])
 
     # Narration: qualitative coaching copy (no numeric "scores" for gTTS).
@@ -1317,27 +1490,28 @@ def _try_build_ai_cinematic_commentary_video(
             "The backswing looks quite open through hip and knee. Aim for a tighter coil so you unwind into the ball with control."
         )
 
+    p2_intro = "Right before the foot meets the ball, "
     if stab >= 72.0 and torso_std <= 8.0:
-        tts2 = (
-            "Through contact, your trunk and hips stay impressively quiet — that stability is what you want for a crisp strike."
+        tts2 = p2_intro + (
+            "your trunk and hips stay impressively quiet — that stability is what you want for a crisp strike."
         )
     elif lean_i > 12.0:
-        tts2 = (
-            "Through impact, the torso is leaning back away from the ball. "
+        tts2 = p2_intro + (
+            "the torso is leaning back away from the ball. "
             "Shift the chest slightly forward so you stay over the strike and hold balance."
         )
     elif lean_i < 4.0:
-        tts2 = (
-            "You are quite upright at impact. A gentle forward angle through the chest helps keep the shot driven and low."
+        tts2 = p2_intro + (
+            "you are quite upright. A gentle forward angle through the chest helps keep the shot driven and low."
         )
     elif torso_std > 10.0:
-        tts2 = (
-            "There is noticeable side-to-side movement in the trunk around impact. "
+        tts2 = p2_intro + (
+            "there is noticeable side-to-side movement in the trunk. "
             "Brace the core and keep the standing foot planted so the upper body stays quieter."
         )
     else:
-        tts2 = (
-            "Stability through impact is acceptable, but some sway remains. "
+        tts2 = p2_intro + (
+            "stability is acceptable, but some sway remains. "
             "Treat the standing leg as an anchor and keep the ribs stacked over the hips."
         )
 
@@ -1356,8 +1530,8 @@ def _try_build_ai_cinematic_commentary_video(
             "Release the leg forward so the strike stays long and committed."
         )
 
-    freeze1_sec = 4.0
-    freeze2_sec = 5.0
+    freeze1_sec = 5.5
+    freeze2_sec = 6.5
     freeze3_sec = 6.5
     slow_rep = 5
 
@@ -1371,7 +1545,17 @@ def _try_build_ai_cinematic_commentary_video(
     _gtts_to_mp3(tts1, tts1_mp3)
     _gtts_to_mp3(tts2, tts2_mp3)
     _gtts_to_mp3(tts3, tts3_mp3)
+    dur1 = _ffprobe_audio_duration_seconds(tts1_mp3)
+    dur2 = _ffprobe_audio_duration_seconds(tts2_mp3)
     dur3 = _ffprobe_audio_duration_seconds(tts3_mp3)
+    if dur1 is not None:
+        freeze1_sec = min(14.0, max(5.5, float(dur1) + 1.35))
+    else:
+        freeze1_sec = max(freeze1_sec, 6.0)
+    if dur2 is not None:
+        freeze2_sec = min(16.0, max(6.5, float(dur2) + 1.35))
+    else:
+        freeze2_sec = max(freeze2_sec, 7.5)
     if dur3 is not None:
         freeze3_sec = min(16.0, max(6.0, float(dur3) + 1.4))
     else:
@@ -1387,15 +1571,45 @@ def _try_build_ai_cinematic_commentary_video(
         cap = None
         return False
 
-    def grab_bgr(fi: int) -> Optional[np.ndarray]:
+    read_state: Dict[str, int] = {"next_fi": 0}
+
+    def read_composed_bgr(fi: int) -> Optional[np.ndarray]:
+        """Sequential decode with rare backward seeks — keeps landmarks aligned with pixels."""
         assert cap is not None
-        fr = _read_cap_frame(cap, fi)
-        if fr is None:
+        if fi < read_state["next_fi"]:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+            ret, fr = cap.read()
+            if not ret or fr is None:
+                return None
+            read_state["next_fi"] = fi + 1
+            return _compose_commentary_frame_bgr(
+                fr,
+                fi,
+                smooth,
+                seq,
+                vis,
+                w,
+                h,
+                kicking_side,
+                phase_start,
+                phase_end,
+                speeds_norm,
+                fps,
+            )
+        while read_state["next_fi"] < fi:
+            ret, fr = cap.read()
+            if not ret:
+                return None
+            read_state["next_fi"] += 1
+        ret, fr = cap.read()
+        if not ret or fr is None:
             return None
+        read_state["next_fi"] = fi + 1
         return _compose_commentary_frame_bgr(
             fr,
             fi,
             smooth,
+            seq,
             vis,
             w,
             h,
@@ -1403,6 +1617,7 @@ def _try_build_ai_cinematic_commentary_video(
             phase_start,
             phase_end,
             speeds_norm,
+            fps,
         )
 
     idx = 0
@@ -1414,22 +1629,23 @@ def _try_build_ai_cinematic_commentary_video(
         idx += 1
 
     try:
+        fb: Optional[np.ndarray] = None
         for fi in range(0, B + 1):
-            bgr = grab_bgr(fi)
+            bgr = read_composed_bgr(fi)
             if bgr is None:
                 continue
             dump_rgb(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-
-        fb = grab_bgr(B)
+            if fi == B:
+                fb = bgr
         if fb is None:
             raise RuntimeError("missing backswing frame")
         hip_mid = (
-            float(smooth[B, 23, 0] + smooth[B, 24, 0]) * 0.5 * w,
-            float(smooth[B, 23, 1] + smooth[B, 24, 1]) * 0.5 * h,
+            float(seq[B, 23, 0] + seq[B, 24, 0]) * 0.5 * w,
+            float(seq[B, 23, 1] + seq[B, 24, 1]) * 0.5 * h,
         )
         hip_circle = (
-            float(smooth[B, kick_hip, 0] * w),
-            float(smooth[B, kick_hip, 1] * h),
+            float(seq[B, kick_hip, 0] * w),
+            float(seq[B, kick_hip, 1] * h),
         )
         fz1 = _freeze_zoom_circle_bgr(fb, hip_mid, 1.5, hip_circle, 28)
         n1 = max(1, int(round(freeze1_sec * fps)))
@@ -1437,42 +1653,47 @@ def _try_build_ai_cinematic_commentary_video(
         for _ in range(n1):
             dump_rgb(rgb1.copy())
 
-        for fi in range(B, I + 1):
-            bgr = grab_bgr(fi)
+        bgr_p2: Optional[np.ndarray] = None
+        for fi in range(B, P2 + 1):
+            bgr = read_composed_bgr(fi)
             if bgr is None:
                 continue
+            if fi == P2:
+                bgr_p2 = bgr
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             for _ in range(slow_rep):
                 dump_rgb(rgb.copy())
 
-        fi_imp = I
-        bi = grab_bgr(fi_imp)
+        bi = bgr_p2
         if bi is None:
-            raise RuntimeError("missing impact frame")
-        stand_xy = (float(smooth[I, stand_ank, 0] * w), float(smooth[I, stand_ank, 1] * h))
+            raise RuntimeError("missing pre-contact frame")
+        instep_xy = (float(seq[P2, kick_ank, 0] * w), float(seq[P2, kick_ank, 1] * h))
         torso_c = (
-            float(smooth[I, 11, 0] + smooth[I, 12, 0]) * 0.5 * w,
-            float(smooth[I, 11, 1] + smooth[I, 12, 1]) * 0.5 * h,
+            float(seq[P2, 11, 0] + seq[P2, 12, 0]) * 0.5 * w,
+            float(seq[P2, 11, 1] + seq[P2, 12, 1]) * 0.5 * h,
         )
-        zoom_c = (0.5 * (stand_xy[0] + torso_c[0]), 0.5 * (stand_xy[1] + torso_c[1]))
-        fz2 = _freeze_zoom_circle_bgr(bi, zoom_c, 2.0, stand_xy, 30)
+        zoom_c = (0.5 * (instep_xy[0] + torso_c[0]), 0.5 * (instep_xy[1] + torso_c[1]))
+        fz2 = _freeze_zoom_circle_bgr(bi, zoom_c, 2.0, instep_xy, 30)
         n2 = max(1, int(round(freeze2_sec * fps)))
         rgb2 = cv2.cvtColor(fz2, cv2.COLOR_BGR2RGB)
         for _ in range(n2):
             dump_rgb(rgb2.copy())
 
-        for fi in range(I, F + 1):
-            bgr = grab_bgr(fi)
+        bgr_f: Optional[np.ndarray] = None
+        for fi in range(P2, F + 1):
+            bgr = read_composed_bgr(fi)
             if bgr is None:
                 continue
+            if fi == F:
+                bgr_f = bgr
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             for _ in range(slow_rep):
                 dump_rgb(rgb.copy())
 
-        bf = grab_bgr(F)
+        bf = bgr_f
         if bf is None:
             raise RuntimeError("missing follow-through frame")
-        knee_xy = (float(smooth[F, kick_knee, 0] * w), float(smooth[F, kick_knee, 1] * h))
+        knee_xy = (float(seq[F, kick_knee, 0] * w), float(seq[F, kick_knee, 1] * h))
         fz3 = _freeze_zoom_circle_bgr(bf, knee_xy, 1.5, knee_xy, 26)
         n3 = max(1, int(round(freeze3_sec * fps)))
         rgb3 = cv2.cvtColor(fz3, cv2.COLOR_BGR2RGB)
@@ -1480,7 +1701,7 @@ def _try_build_ai_cinematic_commentary_video(
             dump_rgb(rgb3.copy())
 
         for fi in range(F + 1, T):
-            bgr = grab_bgr(fi)
+            bgr = read_composed_bgr(fi)
             if bgr is None:
                 continue
             dump_rgb(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
@@ -1518,10 +1739,10 @@ def _try_build_ai_cinematic_commentary_video(
         intro_dur = (B + 1) / max(fps, 1e-3)
         t1 = intro_dur
         d_f1 = float(n1) / max(fps, 1e-3)
-        d_t1 = (max(I, B) - B + 1) * slow_rep / max(fps, 1e-3)
+        d_t1 = (P2 - B + 1) * slow_rep / max(fps, 1e-3)
         t2 = t1 + d_f1 + d_t1
         d_f2 = float(n2) / max(fps, 1e-3)
-        d_t2 = (F - I + 1) * slow_rep / max(fps, 1e-3)
+        d_t2 = (F - P2 + 1) * slow_rep / max(fps, 1e-3)
         t3 = t2 + d_f2 + d_t2
         d_f3 = float(n3) / max(fps, 1e-3)
 
@@ -1853,7 +2074,7 @@ def _build_storyboard(
     bar_h = max(68, int(panel_h * 0.12))
     panel_cards: List[np.ndarray] = []
 
-    for phase_name, _target_t in STORYBOARD_PHASE_TARGETS:
+    for phase_name in STORYBOARD_PANEL_ORDER:
         snap = snapshots.get(phase_name)
         if not snap:
             placeholder = np.zeros((panel_h + bar_h, panel_w, 3), dtype=np.uint8)
@@ -1910,21 +2131,21 @@ def _build_storyboard(
     report[header_h + strip.shape[0] :] = (10, 10, 10)
     cv2.putText(
         report,
-        "AMD INSTINCT™ BIOMECHANICAL REPORT | STRIKE LAB",
+        "BIOMECHANICAL PERFORMANCE INSIGHTS | STRIKE LAB",
         (14, 34),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.72,
+        0.58,
         (236, 236, 236),
         2,
         cv2.LINE_AA,
     )
     cv2.putText(
         report,
-        "ANALYZED VIA ROCm ON AMD MI300X INSTINCT GPU",
+        "Powered by AMD ROCm 6.0 | MI300X Accelerated",
         (14, report.shape[0] - 14),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.62,
-        (220, 220, 220),
+        0.52,
+        (200, 205, 215),
         1,
         cv2.LINE_AA,
     )
@@ -2028,31 +2249,41 @@ def process_video(
         phase_end,
         frames_read,
     )
-    kicking_side = _detect_kicking_leg(smooth, vis, peak_idx)
+    kicking_side = _detect_kicking_leg(smooth, vis, peak_idx, fps, phase_start, phase_end)
 
-    # --- Second pass: encode ---
+    # --- Second pass: pose overlay + storyboard stills (no separate heatmap export; final deliverable is narrated MP4).
     cap = cv2.VideoCapture(str(input_path))
-    # Prefer H.264-style fourcc for OpenCV when it works; mp4v (mpeg4) often will not play in browsers.
-    writer: Optional[cv2.VideoWriter] = None
-    for codec in ("avc1", "H264", "mp4v"):
-        fourcc = cv2.VideoWriter_fourcc(*codec)
-        wri = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
-        if wri.isOpened():
-            writer = wri
-            logger.info("VideoWriter using fourcc=%s", codec)
-            break
-        logger.warning("VideoWriter fourcc=%s failed; trying next codec", codec)
-    if writer is None:
-        raise RuntimeError("Could not open VideoWriter with mp4v or avc1.")
 
     report_path = output_path.with_name(output_path.stem + "_storyboard.png")
-    snapshots: Dict[str, Dict[str, Any]] = {
-        k: {"dist": float("inf")} for k, _ in STORYBOARD_PHASE_TARGETS
+    phases_sb = _detect_cinematic_phases(
+        smooth, z_seq, vis, speeds_norm, peak_idx, phase_start, phase_end, kicking_side, fps
+    )
+    B_sb = int(phases_sb["backswing_peak_idx"])
+    F_sb = int(phases_sb["follow_through_idx"])
+    contact_sb = int(phases_sb.get("contact_idx", int(phases_sb.get("pre_strike_idx", int(phases_sb["impact_idx"])))))
+    gap_sb = int(phases_sb.get("freeze_gap_frames", max(20, int(0.42 * max(float(fps), 1e-3)))))
+    span_s = max(1, F_sb - B_sb)
+    p2_lo = B_sb + max(1, min(gap_sb, max(2, span_s // 4)))
+    if p2_lo > F_sb - 1:
+        max_room_sb = max(1, F_sb - B_sb - 2)
+        gap_eff_sb = min(gap_sb, max_room_sb) if max_room_sb >= 1 else 1
+        p2_lo = B_sb + max(1, gap_eff_sb)
+    if p2_lo > F_sb - 1:
+        p2_lo = max(B_sb + 1, F_sb - 1)
+    p2_hi = max(p2_lo, min(F_sb - 1, int(smooth.shape[0]) - 2))
+    impact_snap = int(np.clip(contact_sb, p2_lo, p2_hi))
+    if impact_snap <= B_sb:
+        impact_snap = min(B_sb + 1, F_sb - 1)
+    if impact_snap >= F_sb:
+        impact_snap = max(B_sb + 1, F_sb - 1)
+    snap_frame_targets: Dict[str, int] = {
+        "windup": B_sb,
+        "impact": impact_snap,
+        "follow": F_sb,
     }
+    snapshots: Dict[str, Dict[str, Any]] = {k: {"dist": float("inf")} for k in snap_frame_targets}
 
     fi = 0
-    out_count = 0
-    base_skel_color = (190, 90, 30)  # kept for optional fallback only
     freeze_source: Optional[np.ndarray] = None
     freeze_form_pct = 0.0
     freeze_knee_ext: Optional[float] = None
@@ -2072,20 +2303,23 @@ def process_video(
             break
 
         out = frame.copy()
-        u_norm = smooth[fi]
+        u_smooth = smooth[fi]
+        u_raw = seq[fi]
         v_row = vis[fi]
         pts_user = np.zeros((33, 2), dtype=np.float64)
         for lm in range(33):
-            pts_user[lm, 0] = u_norm[lm, 0] * w
-            pts_user[lm, 1] = u_norm[lm, 1] * h
+            pts_user[lm, 0] = u_raw[lm, 0] * w
+            pts_user[lm, 1] = u_raw[lm, 1] * h
 
         # Draw only one skeleton layer (heatmap) to avoid duplicate visual outlines.
+        pts_ideal = pts_user.copy()
 
         in_phase = _in_strike_phase(fi, phase_start, phase_end)
+        heat_on, ghost_t_draw = _heatmap_overlay_window(fi, phase_start, phase_end, fps)
         phase_t = _phase_t(fi, phase_start, phase_end) if in_phase else 0.0
         form_pct = 0.0
-        if in_phase:
-            ideal_norm = _generate_corrected_ghost(u_norm, v_row, phase_t, kicking_side)
+        if heat_on:
+            ideal_norm = _generate_corrected_ghost(u_smooth, v_row, ghost_t_draw, kicking_side)
             pts_ideal = np.zeros((33, 2), dtype=np.float64)
             for lm in range(33):
                 pts_ideal[lm, 0] = ideal_norm[lm, 0] * w
@@ -2094,6 +2328,10 @@ def process_video(
             joint_errors = _joint_error_map_deg(pts_user, pts_ideal)
             _draw_heatmap_skeleton(out, pts_user, joint_errors, kicking_side)
             form_pct = _form_match_from_joint_errors(joint_errors)
+        else:
+            _draw_heatmap_skeleton(out, pts_user, {}, kicking_side)
+
+        if in_phase:
             phase_form_scores.append(form_pct)
             tl = _torso_lean_deg(pts_user)
             if tl is not None:
@@ -2102,9 +2340,9 @@ def process_video(
             if ka is not None:
                 phase_knee_angles.append((phase_t, float(ka)))
 
-            # Capture best frames for storyboard targets.
-            for phase_name, target_t in STORYBOARD_PHASE_TARGETS:
-                d = abs(float(phase_t) - target_t)
+            # Storyboard stills: lock to cinematic landmark frames (not % along phase).
+            for phase_name, target_fi in snap_frame_targets.items():
+                d = abs(int(fi) - int(target_fi))
                 if d < float(snapshots[phase_name]["dist"]):
                     snapshots[phase_name] = {
                         "dist": d,
@@ -2120,9 +2358,6 @@ def process_video(
                 freeze_form_pct = form_pct
                 freeze_knee_ext = _joint_angle_deg(pts_user, kick_hip_idx, kick_knee_idx, kick_ank_idx)
                 freeze_torso_lean = _torso_lean_deg(pts_user)
-        else:
-            # Outside strike phase, keep a single-color neutral heatmap skeleton.
-            _draw_heatmap_skeleton(out, pts_user, {}, kicking_side)
 
         # Power meter from normalized speed → px/s equivalent for display
         speed_px_equiv = speeds_norm[fi] * float(np.hypot(w, h))
@@ -2131,7 +2366,7 @@ def process_video(
 
         # Small label near the kicking leg with angle-error-based form score.
         lbl = f"Form Match {form_pct:.0f}%"
-        if not in_phase:
+        if not heat_on:
             lbl = "Form Match --"
         knee_i = 26 if kicking_side == "RIGHT" else 25
         ankle_i = 28 if kicking_side == "RIGHT" else 27
@@ -2156,56 +2391,26 @@ def process_video(
             2,
             cv2.LINE_AA,
         )
-        # Cinematic replay phases:
-        # phase_t in [0.3, 0.7] -> 0.2x visual speed via frame repetition + zoom.
-        is_slowmo = in_phase and 0.3 <= phase_t <= 0.7
-        repeat_n = 5 if is_slowmo else 1
-        for _ in range(repeat_n):
-            frame_to_write = out.copy()
-            if is_slowmo:
-                zoom = _var_zoom_factor(phase_t)
-                if _finite_pt(pts_user, kick_knee_idx) and _finite_pt(pts_user, kick_ank_idx):
-                    zx = float((pts_user[kick_knee_idx, 0] + pts_user[kick_ank_idx, 0]) * 0.5)
-                    zy = float((pts_user[kick_knee_idx, 1] + pts_user[kick_ank_idx, 1]) * 0.5)
-                elif _finite_pt(pts_user, kick_ank_idx):
-                    zx, zy = float(pts_user[kick_ank_idx, 0]), float(pts_user[kick_ank_idx, 1])
-                else:
-                    zx, zy = w * 0.5, h * 0.55
-                frame_to_write = _apply_digital_zoom(frame_to_write, (zx, zy), zoom)
-                blink_on = ((out_count // 4) % 2 == 0)
-                _draw_var_overlay(frame_to_write, blink_on)
-            writer.write(frame_to_write)
-            out_count += 1
-            freeze_source = frame_to_write.copy()
-            freeze_form_pct = form_pct
-            if freeze_knee_ext is None:
-                freeze_knee_ext = _joint_angle_deg(pts_user, kick_hip_idx, kick_knee_idx, kick_ank_idx)
-            if freeze_torso_lean is None:
-                freeze_torso_lean = _torso_lean_deg(pts_user)
         fi += 1
 
     cap.release()
-    # Final freeze frame: 2 seconds at nominal FPS.
     if freeze_source is None:
         freeze_source = np.zeros((h, w, 3), dtype=np.uint8)
-    freeze = freeze_source.copy()
-    _draw_freeze_dashboard(freeze, freeze_knee_ext, freeze_torso_lean, freeze_form_pct)
-    freeze_frames = max(1, int(round(fps * 2.0)))
-    for _ in range(freeze_frames):
-        writer.write(freeze)
-        out_count += 1
-    writer.release()
-    logger.info("Wrote %s (%d source frames -> %d output frames)", output_path, fi, out_count)
-    _try_ffmpeg_browser_mp4(output_path)
     _build_storyboard(report_path, snapshots, w, h, kicking_side)
     logger.info("Wrote storyboard report %s", report_path)
     overall_form = float(np.mean(phase_form_scores)) if phase_form_scores else float(freeze_form_pct)
-    impact_speed = float(speeds_norm[peak_idx] * float(np.hypot(w, h))) if 0 <= peak_idx < speeds_norm.shape[0] else 0.0
+    impact_speed_raw = float(speeds_norm[peak_idx] * float(np.hypot(w, h))) if 0 <= peak_idx < speeds_norm.shape[0] else 0.0
+    impact_speed = impact_speed_raw if impact_speed_raw > 1e-3 else None
     backswing_vals = [ang for t, ang in phase_knee_angles if t <= 0.35]
-    max_backswing_angle = float(max(backswing_vals)) if backswing_vals else 0.0
+    max_backswing_angle = float(max(backswing_vals)) if backswing_vals else None
     impact_window = [ang for t, ang in phase_knee_angles if abs(t - 0.5) <= 0.08]
-    knee_extension_at_impact = float(np.mean(impact_window)) if impact_window else float(freeze_knee_ext or 0.0)
-    torso_stability = float(np.std(phase_torso_leans)) if phase_torso_leans else 0.0
+    if impact_window:
+        knee_extension_at_impact = float(np.mean(impact_window))
+    elif freeze_knee_ext is not None:
+        knee_extension_at_impact = float(freeze_knee_ext)
+    else:
+        knee_extension_at_impact = None
+    torso_stability = float(np.std(phase_torso_leans)) if len(phase_torso_leans) > 1 else None
     mean_lean = float(np.mean(phase_torso_leans)) if phase_torso_leans else float(freeze_torso_lean or 0.0)
     lean_error = abs(mean_lean - _LEAN_TARGET_DEG)
     key_stats = {
@@ -2219,16 +2424,22 @@ def process_video(
     coaching_data = generate_coach_verdict(key_stats)
     coaching_data["overall_form_score"] = round(overall_form, 1)
     coaching_data["key_stats"] = {
-        "impact_speed": round(impact_speed, 1),
-        "max_backswing_angle": round(max_backswing_angle, 1),
-        "torso_stability": round(torso_stability, 2),
+        "impact_speed": None if impact_speed is None else round(impact_speed, 1),
+        "max_backswing_angle": None if max_backswing_angle is None else round(max_backswing_angle, 1),
+        "torso_stability": None if torso_stability is None else round(torso_stability, 2),
+        "knee_extension_at_impact": None if knee_extension_at_impact is None else round(knee_extension_at_impact, 1),
     }
 
-    ai_out = output_path.with_name(output_path.stem + "_ai_cinematic_analysis.mp4")
+    if output_path.is_file():
+        try:
+            output_path.unlink()
+        except OSError:
+            pass
     ok_ai = _try_build_ai_cinematic_commentary_video(
         input_path,
-        ai_out,
+        output_path,
         smooth,
+        seq,
         vis,
         z_seq,
         speeds_norm,
@@ -2240,21 +2451,28 @@ def process_video(
         w,
         h,
     )
-    if ok_ai:
-        logger.info("Wrote AI cinematic commentary %s", ai_out)
+    if not ok_ai or not output_path.is_file():
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(
+            "Narrated biomechanical analysis video could not be produced. "
+            "Ensure moviepy, gTTS, ffmpeg, and ffprobe are installed and working in the app environment."
+        )
+    logger.info("Wrote narrated analysis %s", output_path)
+    _try_ffmpeg_browser_mp4(output_path)
 
     result: Dict[str, Any] = {
         "video_path": str(output_path),
         "report_path": str(report_path),
         "coaching_data": coaching_data,
     }
-    if ok_ai and ai_out.is_file():
-        result["ai_commentary_video_path"] = str(ai_out)
     return result
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Football strike video processor with biomechanical heatmap overlay.")
+    p = argparse.ArgumentParser(description="Football strike video processor — narrated biomechanical analysis MP4.")
     p.add_argument("--input", "-i", type=Path, required=True, help="Input video path")
     p.add_argument("--output", "-o", type=Path, required=True, help="Output MP4 path")
     p.add_argument("--min-detection", type=float, default=0.5)
@@ -2262,13 +2480,13 @@ def main() -> None:
     args = p.parse_args()
 
     if not args.input.is_file():
-        print(f"Input not found: {args.input}", file=sys.stderr)
+        logger.error("Input not found: %s", args.input)
         sys.exit(1)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:
         process_video(args.input, args.output, args.min_detection, args.min_tracking)
     except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        logger.error("Processing failed: %s", e)
         sys.exit(1)
 
 
