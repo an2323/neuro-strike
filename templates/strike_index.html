@@ -343,10 +343,41 @@
         font-size: 0.9rem;
         margin-top: 8px;
       }
+      .drill-badge {
+        display: inline-block;
+        font-size: 0.72rem;
+        border: 1px solid rgba(0, 170, 255, 0.7);
+        color: #7ed8ff;
+        border-radius: 999px;
+        padding: 2px 8px;
+        margin-bottom: 6px;
+      }
       .drill-text {
         margin-top: 6px;
         font-size: 0.8rem;
         color: var(--muted);
+      }
+      .drill-why {
+        margin-top: 6px;
+        font-size: 0.8rem;
+        color: #9bc6db;
+      }
+      .schedule-block {
+        margin-top: 10px;
+        border-top: 1px solid var(--border);
+        padding-top: 10px;
+      }
+      .schedule-title {
+        font-size: 0.82rem;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+      .schedule-row {
+        display: grid;
+        grid-template-columns: 120px 1fr;
+        gap: 10px;
+        font-size: 0.8rem;
+        margin: 4px 0;
       }
     </style>
   </head>
@@ -415,6 +446,7 @@
             <div class="drills-title" style="margin-top:-2px; color: var(--neon);">WATCH &amp; LEARN: ELITE TRAINING DRILLS</div>
             <div class="drills-grid">
               <article class="drill-card">
+                <div class="drill-badge" id="drill1-badge">#1 PRIORITY</div>
                 <div class="drill-embed">
                   <iframe
                     id="drill1-video"
@@ -425,9 +457,11 @@
                   ></iframe>
                 </div>
                 <div class="drill-title" id="drill1-title">--</div>
+                <div class="drill-why" id="drill1-why">Why this? --</div>
                 <div class="drill-text" id="drill1-text">--</div>
               </article>
               <article class="drill-card">
+                <div class="drill-badge" id="drill2-badge">#2 SECONDARY</div>
                 <div class="drill-embed">
                   <iframe
                     id="drill2-video"
@@ -438,8 +472,20 @@
                   ></iframe>
                 </div>
                 <div class="drill-title" id="drill2-title">--</div>
+                <div class="drill-why" id="drill2-why">Why this? --</div>
                 <div class="drill-text" id="drill2-text">--</div>
               </article>
+            </div>
+            <div class="schedule-block">
+              <div class="schedule-title">YOUR PERSONAL RECOVERY &amp; PREP SCHEDULE</div>
+              <div class="schedule-row">
+                <strong>Pre-match</strong>
+                <span id="schedule-prematch">--</span>
+              </div>
+              <div class="schedule-row">
+                <strong>Rest day</strong>
+                <span id="schedule-restday">--</span>
+              </div>
             </div>
           </div>
           <div class="coach-footer">

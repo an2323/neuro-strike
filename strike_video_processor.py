@@ -689,50 +689,83 @@ def generate_coach_verdict(metrics: Dict[str, float]) -> Dict[str, Any]:
     else:
         advice = "Slow down your approach by one step and focus on matching the target body angles."
 
-    recommended_drills: List[Dict[str, str]] = []
-    if knee_extension < 155.0:
-        recommended_drills.append(
+    # Severity ranking for a personalized plan.
+    knee_sev = max(0.0, min(100.0, (170.0 - knee_extension) * 2.0))
+    stab_sev = max(0.0, min(100.0, max(0.0, torso_stability - 6.0) * 10.0))
+    backswing_sev = max(0.0, min(100.0, max(0.0, 75.0 - backswing_angle) * 2.0))
+    issues = [
+        {
+            "metric": "knee_extension",
+            "severity": knee_sev,
+            "label_primary": "TOP PRIORITY: IMMEDIATE FIX",
+            "label_secondary": "STABILITY OPTIMIZATION",
+            "title": "Hamstring Flexibility for Power",
+            "video_id": "YfEb9bLJN-Y",
+            "why": f"To fix knee extension ({knee_extension:.1f}°) and increase strike efficiency.",
+            "instruction": "3 sets of 10 reps per leg to improve flexibility before strike practice.",
+        },
+        {
+            "metric": "torso_stability",
+            "severity": stab_sev,
+            "label_primary": "TOP PRIORITY: IMMEDIATE FIX",
+            "label_secondary": "STABILITY OPTIMIZATION",
+            "title": "Core Balance for Footballers",
+            "video_id": "LLmXxom7-GM",
+            "why": f"To stabilize torso drift ({torso_stability:.2f}° variance) and improve strike control.",
+            "instruction": "3 rounds of 45 seconds, keep hips level and core braced.",
+        },
+        {
+            "metric": "backswing",
+            "severity": backswing_sev,
+            "label_primary": "TOP PRIORITY: IMMEDIATE FIX",
+            "label_secondary": "STABILITY OPTIMIZATION",
+            "title": "Hip Mobility & Power",
+            "video_id": "iVRIO7KkITU",
+            "why": f"To improve backswing loading ({backswing_angle:.1f}°) and add kick whip speed.",
+            "instruction": "15 seconds each side, 3 rounds; open the hips before striking drills.",
+        },
+    ]
+    issues_sorted = sorted(issues, key=lambda x: float(x["severity"]), reverse=True)
+    primary = issues_sorted[0]
+    secondary = issues_sorted[1] if len(issues_sorted) > 1 else issues_sorted[0]
+
+    prioritized_drills = []
+    for rank, item in enumerate((primary, secondary), start=1):
+        prioritized_drills.append(
             {
-                "title": "Hamstring Flexibility for Power",
-                "instruction": "3 sets of 10 reps per leg to improve flexibility before strike practice.",
-                "video_id": "YfEb9bLJN-Y",
-            }
-        )
-    if torso_stability > 9.0:
-        recommended_drills.append(
-            {
-                "title": "Core Stability - Planks",
-                "instruction": "3 rounds of 45 seconds, keep hips level and core braced.",
-                "video_id": "LLmXxom7-GM",
-            }
-        )
-    if backswing_angle < 70.0:
-        recommended_drills.append(
-            {
-                "title": "Hip Mobility & Power",
-                "instruction": "15 seconds each side, 3 rounds; open the hips before striking drills.",
-                "video_id": "iVRIO7KkITU",
-            }
-        )
-    if not recommended_drills:
-        recommended_drills.append(
-            {
-                "title": "Hip Mobility & Power",
-                "instruction": "15 seconds each side, 3 rounds; keep hips free and explosive for cleaner backswing.",
-                "video_id": "iVRIO7KkITU",
+                "rank": rank,
+                "priority_badge": "#1 PRIORITY" if rank == 1 else "#2 SECONDARY",
+                "priority_label": item["label_primary"] if rank == 1 else item["label_secondary"],
+                "title": item["title"],
+                "video_id": item["video_id"],
+                "why_text": item["why"],
+                "instruction": item["instruction"],
+                "prescription": {
+                    "pre_match": "Pre-activation: 1 set, 30% intensity (Focus on movement, don't fatigue muscles).",
+                    "rest_day": "Deep Correction: 3 sets, 80% effort (Build consistency and muscle memory).",
+                },
             }
         )
 
+    top_metric_name = (
+        "knee extension"
+        if primary["metric"] == "knee_extension"
+        else ("stability" if primary["metric"] == "torso_stability" else "backswing mechanics")
+    )
     coaching_audio_text = (
-        f"Great work. Strengths: {', '.join(strengths)}. "
-        f"Main area to improve: {weaknesses[0]}. "
-        f"Coaching tip: {advice}"
+        f"Based on your strike, our top priority is your {top_metric_name}. "
+        f"I've assigned {prioritized_drills[0]['title']} to fix this. "
+        "Secondary, we'll work on your stability. Follow the pre-activation guide before your next session."
+    )
+    advice = (
+        f"I've prioritized {prioritized_drills[0]['title']} because your knee extension is at {knee_extension:.0f}°—"
+        "fixing this can unlock roughly 15% more strike power and cleaner contact."
     )
     return {
         "strengths": strengths,
         "weaknesses": weaknesses,
         "actionable_advice": advice,
-        "recommended_drills": recommended_drills[:2],
+        "recommended_drills": prioritized_drills,
         "coaching_audio_text": coaching_audio_text,
     }
 
