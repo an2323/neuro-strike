@@ -1,5 +1,17 @@
 # StrikeLab — AMD ROCm Football Biomechanics
 
+<div align="center">
+
+### **START HERE — primary landing & live demo**
+
+## [**Open StrikeLab on Hugging Face Spaces →**](https://huggingface.co/spaces/an2323/neuro-strike)
+
+**[https://huggingface.co/spaces/an2323/neuro-strike](https://huggingface.co/spaces/an2323/neuro-strike)**
+
+</div>
+
+---
+
 **StrikeLab** is a football strike biomechanics stack: pose estimation on strike footage, ghost / heatmap-style overlays, coaching metrics, and an optional **narrated cinematic analysis** export.
 
 The project is optimized for **AMD ROCm on MI300X**. The accelerated path uses **ONNX Runtime**, **MIGraphXExecutionProvider**, ROCm / hipBLAS compatibility shims where needed, OpenCV, MoviePy, ffmpeg, and a MediaPipe-based accuracy mode for more stable multi-player footage.
