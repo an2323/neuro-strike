@@ -39,6 +39,8 @@ import os
 os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "0")
 
 GHOST_FRAMES = 30
+_HIP_IDXS = (23, 24)
+_SHOULDER_IDXS = (11, 12)
 
 
 def _try_ffmpeg_browser_mp4(path: Path) -> None:
@@ -269,12 +271,78 @@ def _find_peak_frame(speeds: np.ndarray) -> int:
     return i
 
 
-def _ghost_index_for_frame(frame_idx: int, peak_idx: int) -> Optional[int]:
-    """Map video frame to ghost frame 0..29, or None if outside window."""
-    g = frame_idx - (peak_idx - GHOST_FRAMES // 2)
-    if 0 <= g < GHOST_FRAMES:
-        return g
-    return None
+def _strike_phase_window(speeds: np.ndarray, peak_idx: int) -> Tuple[int, int]:
+    """Estimate wind-up -> follow-through window around peak speed."""
+    n = int(speeds.shape[0])
+    if n <= 1:
+        return (0, max(0, n - 1))
+    peak = float(speeds[peak_idx]) if 0 <= peak_idx < n else 0.0
+    if peak <= 1e-6:
+        span = min(max(1, GHOST_FRAMES), n)
+        s = max(0, (n - span) // 2)
+        return (s, min(n - 1, s + span - 1))
+    thr = max(peak * 0.18, float(np.percentile(speeds, 70)))
+    start = int(peak_idx)
+    end = int(peak_idx)
+    while start > 0 and float(speeds[start - 1]) >= thr:
+        start -= 1
+    while end < n - 1 and float(speeds[end + 1]) >= thr:
+        end += 1
+    # Provide context around detected motion.
+    start = max(0, start - 8)
+    end = min(n - 1, end + 10)
+    return (start, end)
+
+
+def _ghost_index_for_frame(frame_idx: int, phase_start: int, phase_end: int) -> Optional[int]:
+    """Loop ghost frames through the whole detected strike phase."""
+    if frame_idx < phase_start or frame_idx > phase_end:
+        return None
+    return int((frame_idx - phase_start) % GHOST_FRAMES)
+
+
+def _midpoint_xy(points_xy: np.ndarray, idxs: Tuple[int, int], vis: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+    vals: List[np.ndarray] = []
+    for i in idxs:
+        if i < 0 or i >= points_xy.shape[0]:
+            continue
+        p = points_xy[i]
+        if not np.all(np.isfinite(p)):
+            continue
+        if vis is not None and (i >= vis.shape[0] or float(vis[i]) < 0.2):
+            continue
+        vals.append(np.asarray(p, dtype=np.float64))
+    if not vals:
+        return None
+    return np.mean(np.stack(vals, axis=0), axis=0)
+
+
+def _transform_ghost_to_user(ghost_xy_norm: np.ndarray, user_xy_norm: np.ndarray, user_vis: np.ndarray) -> np.ndarray:
+    """
+    Scale ghost by user torso (shoulder↔hip) and center on user's hip midpoint.
+    Works in normalized coords.
+    """
+    g_hip = _midpoint_xy(ghost_xy_norm, _HIP_IDXS, None)
+    g_sh = _midpoint_xy(ghost_xy_norm, _SHOULDER_IDXS, None)
+    u_hip = _midpoint_xy(user_xy_norm, _HIP_IDXS, user_vis)
+    u_sh = _midpoint_xy(user_xy_norm, _SHOULDER_IDXS, user_vis)
+    if g_hip is None or u_hip is None:
+        return ghost_xy_norm.copy()
+    scale = 1.0
+    if g_sh is not None and u_sh is not None:
+        g_torso = float(np.linalg.norm(g_sh - g_hip))
+        u_torso = float(np.linalg.norm(u_sh - u_hip))
+        if g_torso > 1e-4 and np.isfinite(u_torso):
+            scale = float(np.clip(u_torso / g_torso, 0.35, 2.8))
+    return (ghost_xy_norm - g_hip) * scale + u_hip
+
+
+def _is_cornerish_norm(pt_norm: np.ndarray, eps: float = 0.03) -> bool:
+    """Skip vectors around (0,0) / (1,1) to avoid corner-shooting artifacts."""
+    if not np.all(np.isfinite(pt_norm)):
+        return True
+    x, y = float(pt_norm[0]), float(pt_norm[1])
+    return (x <= eps and y <= eps) or (x >= 1.0 - eps and y >= 1.0 - eps)
 
 
 def _form_match_percent(
@@ -499,7 +567,14 @@ def process_video(
 
     speeds_norm = _ankle_speeds(smooth, vis, fps)
     peak_idx = _find_peak_frame(speeds_norm)
-    logger.info("Strike peak aligned at frame %d / %d", peak_idx, frames_read)
+    phase_start, phase_end = _strike_phase_window(speeds_norm, peak_idx)
+    logger.info(
+        "Strike phase: start=%d peak=%d end=%d / %d",
+        phase_start,
+        peak_idx,
+        phase_end,
+        frames_read,
+    )
 
     # --- Second pass: encode ---
     cap = cv2.VideoCapture(str(input_path))
@@ -540,10 +615,10 @@ def process_video(
         _draw_skeleton_lines(out, pts_user, connections, neon_blue, 3)
         _draw_skeleton_points(out, pts_user, neon_blue, 4)
 
-        ghost_g = _ghost_index_for_frame(fi, peak_idx)
+        ghost_g = _ghost_index_for_frame(fi, phase_start, phase_end)
         form_pct = 0.0
         if ghost_g is not None:
-            g_norm = ghost_norm[ghost_g]
+            g_norm = _transform_ghost_to_user(ghost_norm[ghost_g], u_norm, v_row)
             pts_ghost = np.zeros((33, 2), dtype=np.float64)
             for lm in range(33):
                 pts_ghost[lm, 0] = g_norm[lm, 0] * w
@@ -560,6 +635,8 @@ def process_video(
                     continue
                 if not _finite_pt(pts_user, lm) or not _finite_pt(pts_ghost, lm):
                     continue
+                if _is_cornerish_norm(u_norm[lm]) or _is_cornerish_norm(g_norm[lm]):
+                    continue
                 p_u = (int(round(pts_user[lm, 0])), int(round(pts_user[lm, 1])))
                 p_g = (int(round(pts_ghost[lm, 0])), int(round(pts_ghost[lm, 1])))
                 _draw_dashed_line(out, p_u, p_g, error_color, 1, 6, 5)
@@ -574,7 +651,7 @@ def process_video(
         # Form match text
         label = f"Form Match: {form_pct:.1f}%"
         if ghost_g is None:
-            label = "Form Match: -- (ghost off-window)"
+            label = "Form Match: -- (outside strike phase)"
         tw, th = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)[0]
         bx0, bx1 = 8, 8 + tw + 16
         by0, by1 = h - th - 28, h - 8
