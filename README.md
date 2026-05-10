@@ -1,4 +1,4 @@
-# StrikeLab
+# StrikeLab — AMD ROCm Football Biomechanics
 
 **StrikeLab** is a football strike biomechanics stack: pose estimation on strike footage, ghost / heatmap-style overlays, coaching metrics, and an optional **narrated cinematic analysis** export.
 
