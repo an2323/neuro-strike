@@ -242,7 +242,29 @@
       .result-actions {
         margin-top: 16px;
         display: flex;
-        justify-content: flex-end;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .report-wrap {
+        margin-top: 20px;
+        border-radius: 14px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+        background: #050608;
+      }
+      #report-image {
+        width: 100%;
+        display: block;
+      }
+      .report-link {
+        color: var(--neon);
+        text-decoration: none;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-size: 0.86rem;
       }
     </style>
   </head>
@@ -281,11 +303,15 @@
 
       <div id="result-section" class="card" hidden>
         <h2>Analysis output</h2>
-        <p class="hint">Neon skeleton · Gold ghost · Error vectors · Form match %</p>
+        <p class="hint">Cinematic replay + biomechanical storyboard report</p>
         <div class="video-shell">
           <video id="result-video" controls playsinline autoplay></video>
         </div>
+        <div class="report-wrap">
+          <img id="report-image" alt="Biomechanical storyboard report" hidden />
+        </div>
         <div class="result-actions">
+          <a id="report-link" class="report-link" href="#" hidden download>Download Full Report</a>
           <button type="button" class="btn-secondary" id="reset-btn">Reset</button>
         </div>
       </div>

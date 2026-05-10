@@ -28,10 +28,15 @@ from werkzeug.utils import secure_filename
 
 # strike_video_processor pulls cv2 / mediapipe — import lazily so a broken numpy/opencv
 # venv still serves GET / and static UI until deps are repaired (see requirements.txt).
-def _run_process_video(input_path: Path, output_path: Path, min_det: float = 0.5, min_trk: float = 0.5) -> None:
+def _run_process_video(
+    input_path: Path,
+    output_path: Path,
+    min_det: float = 0.5,
+    min_trk: float = 0.5,
+) -> dict:
     from strike_video_processor import process_video
 
-    process_video(input_path, output_path, min_det, min_trk)
+    return process_video(input_path, output_path, min_det, min_trk)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,8 +80,10 @@ def analyze_video():
     uid = uuid.uuid4().hex[:10]
     upload_name = f"upload_{ts}_{uid}{ext}"
     result_name = f"result_{ts}_{uid}.mp4"
+    report_name = f"result_{ts}_{uid}_storyboard.png"
     upload_path = UPLOAD_DIR / upload_name
     result_path = RESULTS_DIR / result_name
+    report_path = RESULTS_DIR / report_name
 
     try:
         f.save(str(upload_path))
@@ -86,7 +93,7 @@ def analyze_video():
         return jsonify({"ok": False, "error": f"Could not save upload: {e}"}), 500
 
     try:
-        _run_process_video(upload_path, result_path)
+        result_meta = _run_process_video(upload_path, result_path)
     except ImportError as e:
         logger.exception("Strike processor import failed (numpy/opencv/mediapipe stack)")
         try:
@@ -95,6 +102,10 @@ def analyze_video():
             pass
         try:
             result_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            report_path.unlink(missing_ok=True)
         except OSError:
             pass
         return jsonify(
@@ -117,6 +128,10 @@ def analyze_video():
             result_path.unlink(missing_ok=True)
         except OSError:
             pass
+        try:
+            report_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return jsonify({"ok": False, "error": str(e)}), 500
     except Exception:
         logger.exception("Processor failed (unexpected)")
@@ -128,10 +143,18 @@ def analyze_video():
             result_path.unlink(missing_ok=True)
         except OSError:
             pass
+        try:
+            report_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return jsonify({"ok": False, "error": "Video processing failed. See server logs."}), 500
 
-    logger.info("Analysis complete -> %s", result_name)
-    return jsonify({"ok": True, "filename": result_name})
+    video_name = Path(result_meta.get("video_path", str(result_path))).name
+    report_name = Path(
+        result_meta.get("report_path", str(result_path.with_name(result_path.stem + "_storyboard.png")))
+    ).name
+    logger.info("Analysis complete -> video=%s report=%s", video_name, report_name)
+    return jsonify({"ok": True, "video_filename": video_name, "report_filename": report_name})
 
 
 @app.route("/results/<filename>")
@@ -144,13 +167,14 @@ def serve_result(filename: str):
     path = RESULTS_DIR / safe
     if not path.is_file():
         abort(404)
-    return send_file(
-        path,
-        mimetype="video/mp4",
-        as_attachment=False,
-        download_name=safe,
-        conditional=True,
-    )
+    ext = path.suffix.lower()
+    if ext == ".png":
+        mimetype = "image/png"
+    elif ext == ".mp4":
+        mimetype = "video/mp4"
+    else:
+        mimetype = None
+    return send_file(path, mimetype=mimetype, as_attachment=False, download_name=safe, conditional=True)
 
 
 if __name__ == "__main__":

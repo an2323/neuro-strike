@@ -10,6 +10,8 @@
   const statusLine2 = document.getElementById("status-line-2");
   const resultSection = document.getElementById("result-section");
   const resultVideo = document.getElementById("result-video");
+  const reportImage = document.getElementById("report-image");
+  const reportLink = document.getElementById("report-link");
   const resetBtn = document.getElementById("reset-btn");
   const errorBanner = document.getElementById("error-banner");
   const fileLabel = document.querySelector('label[for="strike-file"]');
@@ -74,6 +76,14 @@
     analyzeBtn.hidden = false;
     resultVideo.removeAttribute("src");
     resultVideo.load();
+    if (reportImage) {
+      reportImage.removeAttribute("src");
+      reportImage.hidden = true;
+    }
+    if (reportLink) {
+      reportLink.removeAttribute("href");
+      reportLink.hidden = true;
+    }
   }
 
   analyzeBtn.addEventListener("click", async () => {
@@ -98,13 +108,22 @@
         showError(data.error || `Server error (${res.status})`);
         return;
       }
-      const name = data.filename;
-      if (!name) {
+      const videoName = data.video_filename || data.filename;
+      const reportName = data.report_filename;
+      if (!videoName) {
         showError("Missing result filename in response.");
         return;
       }
-      const url = `/results/${encodeURIComponent(name)}`;
+      const url = `/results/${encodeURIComponent(videoName)}`;
       resultVideo.src = url;
+      if (reportImage && reportName) {
+        reportImage.src = `/results/${encodeURIComponent(reportName)}`;
+        reportImage.hidden = false;
+      }
+      if (reportLink && reportName) {
+        reportLink.href = `/results/${encodeURIComponent(reportName)}`;
+        reportLink.hidden = false;
+      }
       uploadCard.hidden = true;
       analyzeBtn.hidden = true;
       resultSection.hidden = false;

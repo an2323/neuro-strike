@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import mediapipe as mp
@@ -91,6 +91,12 @@ POWER_METER_REF_SPEED = 900.0
 # Mean normalized joint error below this maps toward 100% form match
 FORM_MATCH_SCALE = 0.12
 JOINT_ERROR_MAX_DEG = 30.0
+STORYBOARD_PHASE_TARGETS: Tuple[Tuple[str, float], ...] = (
+    ("approach", 0.10),
+    ("windup", 0.30),
+    ("impact", 0.50),
+    ("follow", 0.80),
+)
 # Joints used for form match (core + kicking chain); indices are BlazePose order
 FORM_MATCH_LM_INDICES = (
     0,
@@ -620,6 +626,104 @@ def _draw_heatmap_skeleton(
         cv2.circle(img, (x, y), 5, col, -1, cv2.LINE_AA)
 
 
+def _apply_digital_zoom(
+    frame: np.ndarray,
+    center_xy: Tuple[float, float],
+    zoom: float,
+) -> np.ndarray:
+    """Digital zoom around center while preserving original frame size."""
+    h, w = frame.shape[:2]
+    z = float(max(1.0, zoom))
+    if z <= 1.001:
+        return frame
+    cx = float(np.clip(center_xy[0], 0, w - 1))
+    cy = float(np.clip(center_xy[1], 0, h - 1))
+    crop_w = max(2, int(round(w / z)))
+    crop_h = max(2, int(round(h / z)))
+    x0 = int(round(cx - crop_w / 2))
+    y0 = int(round(cy - crop_h / 2))
+    x0 = int(np.clip(x0, 0, max(0, w - crop_w)))
+    y0 = int(np.clip(y0, 0, max(0, h - crop_h)))
+    crop = frame[y0 : y0 + crop_h, x0 : x0 + crop_w]
+    if crop.size == 0:
+        return frame
+    return cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _var_zoom_factor(phase_t: float) -> float:
+    """Linear zoom ramp: 1.0 -> 1.5 -> 1.0 through slow-mo window."""
+    t = float(np.clip(phase_t, 0.0, 1.0))
+    if t < 0.3 or t > 0.7:
+        return 1.0
+    if t <= 0.4:
+        return 1.0 + 0.5 * ((t - 0.3) / 0.1)
+    if t <= 0.6:
+        return 1.5
+    return 1.5 - 0.5 * ((t - 0.6) / 0.1)
+
+
+def _draw_var_overlay(img: np.ndarray, blink_on: bool) -> None:
+    h, w = img.shape[:2]
+    if blink_on:
+        cv2.putText(
+            img,
+            "\u2022 VAR ANALYSING",
+            (w - 275, 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (40, 40, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    rec_x = w - 96
+    rec_y = 56
+    cv2.rectangle(img, (rec_x, rec_y - 18), (rec_x + 72, rec_y + 8), (20, 20, 20), -1)
+    cv2.rectangle(img, (rec_x, rec_y - 18), (rec_x + 72, rec_y + 8), (60, 60, 255), 1)
+    cv2.circle(img, (rec_x + 12, rec_y - 5), 5, (30, 30, 255), -1, cv2.LINE_AA)
+    cv2.putText(img, "REC", (rec_x + 22, rec_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 255), 1, cv2.LINE_AA)
+
+
+def _torso_lean_deg(pts: np.ndarray) -> Optional[float]:
+    req = (11, 12, 23, 24)
+    if not all(_finite_pt(pts, i) for i in req):
+        return None
+    mid_hip = (pts[23] + pts[24]) * 0.5
+    mid_sh = (pts[11] + pts[12]) * 0.5
+    torso = mid_sh - mid_hip
+    if float(np.linalg.norm(torso)) < 1e-6:
+        return None
+    return abs(float(np.degrees(np.arctan2(torso[0], -torso[1]))))
+
+
+def _draw_freeze_dashboard(
+    img: np.ndarray,
+    knee_ext_deg: Optional[float],
+    torso_lean_deg: Optional[float],
+    form_pct: float,
+) -> None:
+    h, w = img.shape[:2]
+    x0, y0 = int(w * 0.08), int(h * 0.16)
+    x1, y1 = int(w * 0.62), int(h * 0.58)
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (18, 18, 18), -1)
+    cv2.addWeighted(overlay, 0.62, img, 0.38, 0.0, img)
+    cv2.rectangle(img, (x0, y0), (x1, y1), (70, 170, 255), 2)
+    cv2.putText(img, "AI COACH ANALYSIS", (x0 + 18, y0 + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (220, 240, 255), 2, cv2.LINE_AA)
+
+    knee_txt = "--" if knee_ext_deg is None else f"{knee_ext_deg:.1f}\u00b0"
+    lean_txt = "--" if torso_lean_deg is None else f"{torso_lean_deg:.1f}\u00b0"
+    lines = [
+        f"Knee Extension: {knee_txt}",
+        f"Torso Lean: {lean_txt}",
+        f"Overall Form Match: {form_pct:.1f}%",
+    ]
+    status = "PRO FORM" if form_pct >= 82.0 and (knee_ext_deg or 0.0) >= 160.0 and 5.0 <= (torso_lean_deg or 0.0) <= 10.0 else "NEEDS BENDING"
+    lines.append(f"Status: {status}")
+    y = y0 + 78
+    for ln in lines:
+        cv2.putText(img, ln, (x0 + 18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.66, (235, 235, 235), 2, cv2.LINE_AA)
+        y += 38
+
 def _draw_dashed_line(
     img: np.ndarray,
     p1: Tuple[int, int],
@@ -741,12 +845,163 @@ def _draw_power_meter(
     )
 
 
+def _athlete_bbox_from_pts(pts_user: np.ndarray) -> Optional[Tuple[float, float, float, float]]:
+    valid: List[Tuple[float, float]] = []
+    for i in range(pts_user.shape[0]):
+        if not _finite_pt(pts_user, i):
+            continue
+        valid.append((float(pts_user[i, 0]), float(pts_user[i, 1])))
+    if not valid:
+        return None
+    xs = np.array([p[0] for p in valid], dtype=np.float64)
+    ys = np.array([p[1] for p in valid], dtype=np.float64)
+    return float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())
+
+
+def _storyboard_crop_params(
+    frame_w: int,
+    frame_h: int,
+    pts_user: np.ndarray,
+    panel_w: int,
+    panel_h: int,
+    phase_name: str,
+) -> Tuple[int, int, int, int]:
+    bbox = _athlete_bbox_from_pts(pts_user)
+    if bbox is None:
+        return 0, 0, frame_w, frame_h
+    x0, y0, x1, y1 = bbox
+    bw = max(1.0, x1 - x0)
+    bh = max(1.0, y1 - y0)
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    target_athlete_ratio = 0.72
+    crop_h = int(np.clip(bh / target_athlete_ratio, frame_h * 0.34, frame_h))
+    crop_w = int(round(crop_h * (panel_w / max(panel_h, 1))))
+    crop_w = int(np.clip(crop_w, frame_w * 0.20, frame_w))
+    if phase_name == "impact":
+        crop_h = max(2, int(round(crop_h * 0.78)))
+        crop_w = max(2, int(round(crop_w * 0.78)))
+        if _finite_pt(pts_user, 27) and _finite_pt(pts_user, 28):
+            cx = float((pts_user[27, 0] + pts_user[28, 0]) * 0.5)
+            cy = float((pts_user[27, 1] + pts_user[28, 1]) * 0.5)
+    x = int(round(cx - crop_w * 0.5))
+    y = int(round(cy - crop_h * 0.5))
+    x = int(np.clip(x, 0, max(0, frame_w - crop_w)))
+    y = int(np.clip(y, 0, max(0, frame_h - crop_h)))
+    return x, y, crop_w, crop_h
+
+
+def _panel_verdict(knee_err: float, lean_err: float, impact_speed_px: float) -> str:
+    verdicts: List[str] = []
+    if knee_err > 15.0:
+        verdicts.append("Increase Knee Extension")
+    if lean_err < 5.0:
+        verdicts.append("Optimal Torso Lean")
+    if impact_speed_px >= 700.0:
+        verdicts.append("High Velocity Strike")
+    if not verdicts:
+        verdicts.append("Maintain Posture Consistency")
+    return " | ".join(verdicts[:2])
+
+
+def _build_storyboard(
+    report_path: Path,
+    snapshots: Dict[str, Dict[str, Any]],
+    frame_w: int,
+    frame_h: int,
+    kicking_side: str,
+) -> None:
+    panel_h = max(360, frame_h)
+    panel_w = max(200, int(round(panel_h * 9.0 / 16.0)))
+    bar_h = max(68, int(panel_h * 0.12))
+    panel_cards: List[np.ndarray] = []
+
+    for phase_name, _target_t in STORYBOARD_PHASE_TARGETS:
+        snap = snapshots.get(phase_name)
+        if not snap:
+            placeholder = np.zeros((panel_h + bar_h, panel_w, 3), dtype=np.uint8)
+            cv2.putText(placeholder, phase_name.upper(), (18, panel_h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (240, 240, 240), 2, cv2.LINE_AA)
+            panel_cards.append(placeholder)
+            continue
+
+        frame_raw = snap["frame_raw"].copy()
+        pts_user = snap["pts_user"].copy()
+        pts_ideal = snap["pts_ideal"].copy()
+        x, y, cw, ch = _storyboard_crop_params(frame_w, frame_h, pts_user, panel_w, panel_h, phase_name)
+        crop = frame_raw[y : y + ch, x : x + cw]
+        panel = cv2.resize(crop, (panel_w, panel_h), interpolation=cv2.INTER_CUBIC)
+
+        sx = panel_w / max(cw, 1)
+        sy = panel_h / max(ch, 1)
+        pts_user_panel = np.zeros_like(pts_user)
+        pts_ideal_panel = np.zeros_like(pts_ideal)
+        pts_user_panel[:, 0] = (pts_user[:, 0] - x) * sx
+        pts_user_panel[:, 1] = (pts_user[:, 1] - y) * sy
+        pts_ideal_panel[:, 0] = (pts_ideal[:, 0] - x) * sx
+        pts_ideal_panel[:, 1] = (pts_ideal[:, 1] - y) * sy
+
+        # Draw heatmap after crop/zoom for crisp lines.
+        panel_joint_errors = _joint_error_map_deg(pts_user_panel, pts_ideal_panel)
+        if phase_name == "impact":
+            panel_joint_errors = {k: float(min(JOINT_ERROR_MAX_DEG, v * 1.45)) for k, v in panel_joint_errors.items()}
+        _draw_heatmap_skeleton(panel, pts_user_panel, panel_joint_errors, kicking_side)
+
+        knee_idx = 26 if kicking_side == "RIGHT" else 25
+        hip_idx = 24 if kicking_side == "RIGHT" else 23
+        ank_idx = 28 if kicking_side == "RIGHT" else 27
+        ideal_knee = _joint_angle_deg(pts_ideal_panel, hip_idx, knee_idx, ank_idx)
+        user_knee = _joint_angle_deg(pts_user_panel, hip_idx, knee_idx, ank_idx)
+        knee_err = 0.0 if ideal_knee is None or user_knee is None else _angle_abs_diff_deg(user_knee, ideal_knee)
+        user_lean = _torso_lean_deg(pts_user_panel) or 0.0
+        lean_err = abs(user_lean - _LEAN_TARGET_DEG)
+        verdict = _panel_verdict(knee_err, lean_err, float(snap.get("impact_speed_px", 0.0)))
+
+        bar = np.zeros((bar_h, panel_w, 3), dtype=np.uint8)
+        cv2.rectangle(bar, (0, 0), (panel_w - 1, bar_h - 1), (8, 8, 8), -1)
+        cv2.rectangle(bar, (0, 0), (panel_w - 1, bar_h - 1), (90, 90, 90), 1)
+        cv2.putText(bar, verdict, (10, int(bar_h * 0.62)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (245, 245, 245), 1, cv2.LINE_AA)
+
+        card = np.vstack([panel, bar])
+        panel_cards.append(card)
+
+    strip = cv2.hconcat(panel_cards)
+    header_h = 54
+    footer_h = 48
+    report = np.zeros((header_h + strip.shape[0] + footer_h, strip.shape[1], 3), dtype=np.uint8)
+    report[:header_h] = (12, 12, 12)
+    report[header_h : header_h + strip.shape[0]] = strip
+    report[header_h + strip.shape[0] :] = (10, 10, 10)
+    cv2.putText(
+        report,
+        "AMD INSTINCT™ BIOMECHANICAL REPORT | STRIKE LAB",
+        (14, 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        (236, 236, 236),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        report,
+        "ANALYZED VIA ROCm ON AMD MI300X INSTINCT GPU",
+        (14, report.shape[0] - 14),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA,
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(report_path), report):
+        raise RuntimeError(f"Failed to write storyboard report: {report_path}")
+
+
 def process_video(
     input_path: Path,
     output_path: Path,
     min_detection: float = 0.5,
     min_tracking: float = 0.5,
-) -> None:
+) -> Dict[str, str]:
     mp_pose = mp.solutions.pose
     connections = [(int(a), int(b)) for a, b in mp_pose.POSE_CONNECTIONS]
 
@@ -844,8 +1099,21 @@ def process_video(
     if writer is None:
         raise RuntimeError("Could not open VideoWriter with mp4v or avc1.")
 
+    report_path = output_path.with_name(output_path.stem + "_storyboard.png")
+    snapshots: Dict[str, Dict[str, Any]] = {
+        k: {"dist": float("inf")} for k, _ in STORYBOARD_PHASE_TARGETS
+    }
+
     fi = 0
+    out_count = 0
     base_skel_color = (190, 90, 30)  # dim blue base under heatmap
+    freeze_source: Optional[np.ndarray] = None
+    freeze_form_pct = 0.0
+    freeze_knee_ext: Optional[float] = None
+    freeze_torso_lean: Optional[float] = None
+    kick_knee_idx = 26 if kicking_side == "RIGHT" else 25
+    kick_hip_idx = 24 if kicking_side == "RIGHT" else 23
+    kick_ank_idx = 28 if kicking_side == "RIGHT" else 27
 
     while True:
         ret, frame = cap.read()
@@ -867,10 +1135,10 @@ def process_video(
         _draw_skeleton_points(out, pts_user, base_skel_color, 3)
 
         in_phase = _in_strike_phase(fi, phase_start, phase_end)
+        phase_t = _phase_t(fi, phase_start, phase_end) if in_phase else 0.0
         form_pct = 0.0
         if in_phase:
-            pt = _phase_t(fi, phase_start, phase_end)
-            ideal_norm = _generate_corrected_ghost(u_norm, v_row, pt, kicking_side)
+            ideal_norm = _generate_corrected_ghost(u_norm, v_row, phase_t, kicking_side)
             pts_ideal = np.zeros((33, 2), dtype=np.float64)
             for lm in range(33):
                 pts_ideal[lm, 0] = ideal_norm[lm, 0] * w
@@ -879,6 +1147,25 @@ def process_video(
             joint_errors = _joint_error_map_deg(pts_user, pts_ideal)
             _draw_heatmap_skeleton(out, pts_user, joint_errors, kicking_side)
             form_pct = _form_match_from_joint_errors(joint_errors)
+
+            # Capture best frames for storyboard targets.
+            for phase_name, target_t in STORYBOARD_PHASE_TARGETS:
+                d = abs(float(phase_t) - target_t)
+                if d < float(snapshots[phase_name]["dist"]):
+                    snapshots[phase_name] = {
+                        "dist": d,
+                        "frame_raw": frame.copy(),
+                        "pts_user": pts_user.copy(),
+                        "pts_ideal": pts_ideal.copy(),
+                        "impact_speed_px": float(speeds_norm[fi] * float(np.hypot(w, h))),
+                        "form_pct": float(form_pct),
+                    }
+            # Keep a dashboard snapshot around impact.
+            if 0.45 <= phase_t <= 0.55:
+                freeze_source = out.copy()
+                freeze_form_pct = form_pct
+                freeze_knee_ext = _joint_angle_deg(pts_user, kick_hip_idx, kick_knee_idx, kick_ank_idx)
+                freeze_torso_lean = _torso_lean_deg(pts_user)
 
         # Power meter from normalized speed → px/s equivalent for display
         speed_px_equiv = speeds_norm[fi] * float(np.hypot(w, h))
@@ -912,14 +1199,50 @@ def process_video(
             2,
             cv2.LINE_AA,
         )
-
-        writer.write(out)
+        # Cinematic replay phases:
+        # phase_t in [0.3, 0.7] -> 0.2x visual speed via frame repetition + zoom.
+        is_slowmo = in_phase and 0.3 <= phase_t <= 0.7
+        repeat_n = 5 if is_slowmo else 1
+        for _ in range(repeat_n):
+            frame_to_write = out.copy()
+            if is_slowmo:
+                zoom = _var_zoom_factor(phase_t)
+                if _finite_pt(pts_user, kick_knee_idx) and _finite_pt(pts_user, kick_ank_idx):
+                    zx = float((pts_user[kick_knee_idx, 0] + pts_user[kick_ank_idx, 0]) * 0.5)
+                    zy = float((pts_user[kick_knee_idx, 1] + pts_user[kick_ank_idx, 1]) * 0.5)
+                elif _finite_pt(pts_user, kick_ank_idx):
+                    zx, zy = float(pts_user[kick_ank_idx, 0]), float(pts_user[kick_ank_idx, 1])
+                else:
+                    zx, zy = w * 0.5, h * 0.55
+                frame_to_write = _apply_digital_zoom(frame_to_write, (zx, zy), zoom)
+                blink_on = ((out_count // 4) % 2 == 0)
+                _draw_var_overlay(frame_to_write, blink_on)
+            writer.write(frame_to_write)
+            out_count += 1
+            freeze_source = frame_to_write.copy()
+            freeze_form_pct = form_pct
+            if freeze_knee_ext is None:
+                freeze_knee_ext = _joint_angle_deg(pts_user, kick_hip_idx, kick_knee_idx, kick_ank_idx)
+            if freeze_torso_lean is None:
+                freeze_torso_lean = _torso_lean_deg(pts_user)
         fi += 1
 
     cap.release()
+    # Final freeze frame: 2 seconds at nominal FPS.
+    if freeze_source is None:
+        freeze_source = np.zeros((h, w, 3), dtype=np.uint8)
+    freeze = freeze_source.copy()
+    _draw_freeze_dashboard(freeze, freeze_knee_ext, freeze_torso_lean, freeze_form_pct)
+    freeze_frames = max(1, int(round(fps * 2.0)))
+    for _ in range(freeze_frames):
+        writer.write(freeze)
+        out_count += 1
     writer.release()
-    logger.info("Wrote %s (%d frames)", output_path, fi)
+    logger.info("Wrote %s (%d source frames -> %d output frames)", output_path, fi, out_count)
     _try_ffmpeg_browser_mp4(output_path)
+    _build_storyboard(report_path, snapshots, w, h, kicking_side)
+    logger.info("Wrote storyboard report %s", report_path)
+    return {"video_path": str(output_path), "report_path": str(report_path)}
 
 
 def main() -> None:
